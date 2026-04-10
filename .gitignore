@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 模型权重（大文件，按需下载）
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# 输出目录
+output/
+results/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
