@@ -1,0 +1,9 @@
+# 核心依赖
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# 深度学习检测（可选，mode='yolo' 时需要）
+ultralytics>=8.0.0
+
+# 测试
+pytest>=7.4.0
