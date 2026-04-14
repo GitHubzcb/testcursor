@@ -55,8 +55,8 @@ BOOL CPayBoardTestDlg::IsExcelFileOpen(const CString& filePath);
 1. 通过 `GetActiveObject` 获取当前运行的 Excel COM 实例。如果没有 Excel 在运行，直接返回 `FALSE`。
 2. 通过 `QueryInterface` 获取 `IDispatch` 接口，附加到 `CApplication` 对象。
 3. 遍历所有已打开的工作簿（`CWorkbooks`），对每个工作簿：
-   - 获取工作簿名称（如 `demo.xlsx`）
-   - 去掉扩展名后与目标文件名做**不区分大小写**的比较
+   - 使用 `book.get_FullName()` 获取工作簿的**完整路径**
+   - 与传入的 `filePath` 做**不区分大小写**的比较
 4. 如果找到匹配项返回 `TRUE`，否则返回 `FALSE`。
 
 **依赖**：
@@ -64,6 +64,5 @@ BOOL CPayBoardTestDlg::IsExcelFileOpen(const CString& filePath);
 - Excel 类型库生成的包装类（`CApplication`、`CWorkbooks`、`CWorkbook`）
 
 **注意事项**：
-- 当前实现仅比较文件名（不含扩展名），不比较完整路径。如果不同目录下存在同名 Excel 文件，可能产生误判。
-- 如需精确匹配，可改用 `book.get_FullName()` 与 `filePath` 做完整路径比较（代码中已有注释示例）。
+- 使用 `get_FullName()` 而非 `get_Name()` 进行比较，原因是 `Workbook.Name` 在某些情况下会被 Excel 自动追加数字后缀（如同名文件冲突时），导致匹配失败。
 - `GetActiveObject` 只能获取到 ROT（Running Object Table）中注册的第一个 Excel 实例，多实例场景下可能无法检测到所有打开的文件。
