@@ -1,0 +1,61 @@
+// Microsoft Visual C++ generated resource script.
+//
+// 注意：这是一个简化的资源文件示例。
+// 实际项目中请使用 Visual Studio 资源编辑器创建和编辑。
+
+#include "winres.h"
+#include "../src/Resource.h"
+
+/////////////////////////////////////////////////////////////////////////////
+// 对话框资源
+
+IDD_VOICECONTROL_DIALOG DIALOGEX 0, 0, 420, 340
+STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | WS_POPUP | WS_VISIBLE |
+      WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CAPTION "MFC 语音控制系统"
+FONT 9, "微软雅黑", 400, 0, 0x86
+BEGIN
+    // ====== 语音控制区域 ======
+    GROUPBOX        "语音控制", IDC_STATIC, 7, 7, 406, 80
+
+    PUSHBUTTON      "开始监听(&S)", IDC_BTN_START_LISTEN,  15, 22, 80, 24
+    PUSHBUTTON      "停止监听(&T)", IDC_BTN_STOP_LISTEN,   100, 22, 80, 24
+
+    LTEXT           "状态:", IDC_STATIC, 190, 26, 24, 12
+    LTEXT           "就绪", IDC_STATIC_STATUS, 216, 26, 190, 12
+
+    LTEXT           "识别结果:", IDC_STATIC, 15, 52, 48, 12
+    EDITTEXT        IDC_EDIT_ASR_RESULT, 68, 50, 338, 28,
+                    ES_MULTILINE | ES_AUTOHSCROLL | ES_READONLY | WS_BORDER
+
+    // ====== 参数设置区域 ======
+    GROUPBOX        "参数设置", IDC_STATIC, 7, 92, 260, 110
+
+    LTEXT           "温度:", IDC_STATIC_TEMP_LABEL, 15, 112, 30, 12
+    EDITTEXT        IDC_EDIT_TEMPERATURE, 50, 110, 80, 14,
+                    ES_AUTOHSCROLL | WS_BORDER
+    LTEXT           "°C", IDC_STATIC_TEMP_UNIT, 135, 112, 16, 12
+
+    LTEXT           "湿度:", IDC_STATIC_HUMID_LABEL, 15, 132, 30, 12
+    EDITTEXT        IDC_EDIT_HUMIDITY, 50, 130, 80, 14,
+                    ES_AUTOHSCROLL | WS_BORDER
+    LTEXT           "%", IDC_STATIC_HUMID_UNIT, 135, 132, 12, 12
+
+    LTEXT           "压力:", IDC_STATIC_PRESS_LABEL, 15, 152, 30, 12
+    EDITTEXT        IDC_EDIT_PRESSURE, 50, 150, 80, 14,
+                    ES_AUTOHSCROLL | WS_BORDER
+    LTEXT           "kPa", IDC_STATIC_PRESS_UNIT, 135, 152, 20, 12
+
+    LTEXT           "模式:", IDC_STATIC, 15, 177, 30, 12
+    COMBOBOX        IDC_COMBO_MODE, 50, 175, 80, 80,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "应用", IDC_BTN_APPLY_MODE, 140, 174, 40, 16
+
+    PUSHBUTTON      "确定(&O)", IDC_BTN_CONFIRM, 200, 110, 60, 24
+    PUSHBUTTON      "重置(&R)", IDC_BTN_RESET,   200, 145, 60, 24
+
+    // ====== 操作日志区域 ======
+    GROUPBOX        "操作日志", IDC_STATIC, 7, 207, 406, 126
+    LISTBOX         IDC_LIST_LOG, 15, 222, 390, 105,
+                    LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_BORDER
+END
