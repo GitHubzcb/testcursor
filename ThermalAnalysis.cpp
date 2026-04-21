@@ -406,39 +406,46 @@ static std::wstring FormatSideStat(
 
 // ===================================================================
 //  BuildLLMPrompt
-//  改动：新增 facings 参数（与 allImages 一一对应），
-//        在每张图标题中标注"正面 / 背面 / 未知朝向"，
-//        轴对称区域名称根据朝向动态映射（背面→背部/腰背部等）。
+//
+//  采用"前缀补全"模式：提示词最后直接以报告第一行【数据摘要】结尾，
+//  利用 llama.cpp /completion 的纯续写特性让模型从该位置接着生成，
+//  彻底避免模型将格式规则当成正文输出。
+//
+//  结构：
+//    <简短角色声明（1行）>
+//    <异常判断准则（内嵌在数据旁，用⚠标记）>
+//    检测数据：
+//      图像N（正面/背面）：
+//        区域名：左/右均值℃（最高 最低 标准差）差值 [⚠]
+//        ...
+//    ---
+//    根据以上数据，用中文写红外热成像诊断报告：
+//    【数据摘要】
+//  <---- 模型从这里续写 ---->
 // ===================================================================
 std::wstring BuildLLMPrompt(
     const std::vector<std::map<int, RegionTempStat>>& allImages,
-    const std::vector<BodyFacing>& facings          // 与 allImages 等长
+    const std::vector<BodyFacing>& facings
 )
 {
     std::wstring prompt;
 
-    // ---- 角色 ----
-    prompt += L"你是一名临床医学红外热成像分析专家。\n";
-    prompt += L"必须用中文输出确定内容诊断报告，不需要分析过程。\n\n";
+    // ---- 角色声明（极简，不含任何"输出要求"列表）----
+    prompt += L"你是临床医学红外热成像分析专家。"
+              L"左右差≥0.8℃或均值>37℃或<28℃或标准差≥1.5℃视为异常。\n\n";
 
-    // ---- 数据 ----
-    prompt += L"【数据】\n";
+    // ---- 检测数据 ----
+    prompt += L"检测数据：\n";
 
     for (size_t imgIdx = 0; imgIdx < allImages.size(); imgIdx++)
     {
         const auto& stats = allImages[imgIdx];
-
-        // 取当前图像的朝向（若 facings 长度不足则默认 UNKNOWN）
         BodyFacing facing = (imgIdx < facings.size())
-            ? facings[imgIdx]
-            : FACING_UNKNOWN;
+            ? facings[imgIdx] : FACING_UNKNOWN;
 
-        // 图像标题 + 朝向标注
         wchar_t imgHeader[128];
         swprintf_s(imgHeader, sizeof(imgHeader) / sizeof(wchar_t),
-            L"图像%zu（%ls）：\n",
-            imgIdx + 1,
-            BodyFacingName[facing]);
+            L"图像%zu（%ls）：\n", imgIdx + 1, BodyFacingName[facing]);
         prompt += imgHeader;
 
         // ---- 对称配对区域（左右分侧）----
@@ -446,10 +453,8 @@ std::wstring BuildLLMPrompt(
         {
             auto itL = stats.find(pair.left);
             auto itR = stats.find(pair.right);
-
             bool hasL = (itL != stats.end() && itL->second.pixelCount > 0);
             bool hasR = (itR != stats.end() && itR->second.pixelCount > 0);
-
             if (!hasL && !hasR) continue;
 
             prompt += std::wstring(L"  ") + pair.name + L"：\n";
@@ -462,73 +467,49 @@ std::wstring BuildLLMPrompt(
                 float diff = std::fabs(itL->second.meanTemp - itR->second.meanTemp);
                 wchar_t diffBuf[128];
                 if (diff >= kLRDiffWarn)
-                {
                     swprintf_s(diffBuf, sizeof(diffBuf) / sizeof(wchar_t),
-                        L"  差值：%.1f℃  ⚠ 左右温差偏大，建议重点关注\n", diff);
-                }
+                        L"  差值：%.1f℃ ⚠\n", diff);
                 else
-                {
                     swprintf_s(diffBuf, sizeof(diffBuf) / sizeof(wchar_t),
                         L"  差值：%.1f℃\n", diff);
-                }
                 prompt += diffBuf;
             }
         }
 
-        // ---- 轴对称区域（名称随朝向动态映射）----
+        // ---- 轴对称区域 ----
         for (const auto& sr : kSingleRegions)
         {
             auto it = stats.find(sr.first);
             if (it == stats.end() || it->second.pixelCount == 0) continue;
 
             const RegionTempStat& s = it->second;
-            // 根据朝向选择区域名称
             const wchar_t* regionLabel = GetRegionName(sr.first, facing);
+
+            // 判断是否有异常标记
+            bool hot     = s.meanTemp > 37.0f;
+            bool cold    = s.meanTemp < 28.0f;
+            bool uneven  = s.stdDev   >= 1.5f;
+            const wchar_t* warn = (hot || cold || uneven) ? L" ⚠" : L"";
 
             wchar_t buf[256];
             swprintf_s(buf, sizeof(buf) / sizeof(wchar_t),
-                L"  %ls：均值 %.1f℃  最高 %.1f℃  最低 %.1f℃  标准差 %.2f℃\n",
-                regionLabel,
-                s.meanTemp, s.maxTemp, s.minTemp, s.stdDev);
+                L"  %ls：均值 %.1f℃  最高 %.1f℃  最低 %.1f℃  标准差 %.2f℃%ls\n",
+                regionLabel, s.meanTemp, s.maxTemp, s.minTemp, s.stdDev, warn);
             prompt += buf;
         }
+
+        // 背面时追加一行简短提示（不用长段落，避免模型回显）
+        if (facing == FACING_BACK)
+            prompt += L"  （背面：背部=胸腔对应区，腰背部=腹部对应区）\n";
 
         prompt += L"\n";
     }
 
-    // ---- 是否含背面图像，追加背面专项说明 ----
-    bool hasBack = false;
-    for (auto f : facings)
-        if (f == FACING_BACK) { hasBack = true; break; }
-
-    if (hasBack)
-    {
-        prompt +=
-            L"【背面图像说明】\n"
-            L"背面图像中"背部"对应正面的胸腔区域，"腰背部"对应正面的腹部，\n"
-            L""下背/臀部"对应正面的腰部，请结合临床背部热成像规律分析。\n\n";
-    }
-
-    // ---- 输出要求 ----
+    // ---- 前缀补全触发词：提示词最后以报告第一行结束 ----
+    // 模型看到这里会直接续写报告正文，不会重复任何上文内容。
     prompt +=
-        L"\n【输出要求】\n"
-        L"1. 必须完整输出以下三个部分：\n"
-        L"   【数据摘要】\n"
-        L"   【各区域分析】\n"
-        L"   【最终结论】\n"
-        L"\n"
-        L"2. 【各区域分析】格式示例：\n"
-        L"   大腿：左 35.4℃ / 右 36.2℃，差值 0.8℃，轻度不对称，建议随访\n"
-        L"\n"
-        L"3. 异常判断规则：\n"
-        L"   - 左右均值差 ≥ 0.8℃：提示温度不对称，可能存在炎症或血液循环异常\n"
-        L"   - 区域均值超过正常体表温度（>37℃）：提示局部高温\n"
-        L"   - 区域均值低于 28℃：提示局部低温或血液循环不足\n"
-        L"   - 标准差 ≥ 1.5℃：提示区域内温度分布不均匀\n"
-        L"\n"
-        L"4. 如无明显异常，写"整体无明显异常"\n"
-        L"5. 禁止输出多余分析、说明或编程内容\n"
-        L"6. 无需输出思考过程，直接出结果\n";
+        L"根据以上检测数据，写中文红外热成像诊断报告：\n"
+        L"【数据摘要】\n";
 
     return prompt;
 }

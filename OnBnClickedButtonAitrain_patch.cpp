@@ -66,6 +66,20 @@
 //      std::wstring promptW = BuildLLMPrompt(allImages, allFacings);   // ★★
 // ---------------------------------------------------------------
 
+// ---------------------------------------------------------------
+//  [修改6] CallGemma / CallLLM 参数调整（防止模型输出乱内容）
+//
+//  在 json j 构造处添加以下字段，让模型在输出完【最终结论】后停止：
+//
+//      j["stop"] = { "---", "检测数据", "根据以上", "```" };
+//
+//  n_predict 建议调整为 512，给三个章节足够空间但不过长：
+//      j["n_predict"] = 512;
+//
+//  同时去掉或注释掉 j["ignore_eos"] = true，
+//  否则模型遇到结束符也不会停止，会一直输出直到 n_predict 耗尽。
+// ---------------------------------------------------------------
+
 
 // ===================================================================
 //  完整替换后的 OnBnClickedButtonAitrain 核心循环（供直接复制）
@@ -185,6 +199,10 @@ void CThermal_Analysis_CAMDiagnosisDlg::OnBnClickedButtonAitrain()
     std::wstring promptW = BuildLLMPrompt(allImages, allFacings);
     CStringW input(promptW.c_str());
 
+    // CallGemma 内部 json 参数建议改为：
+    //   j["n_predict"]      = 512;
+    //   j["stop"]           = { "---", "检测数据", "根据以上", "```" };
+    //   // 删除或注释 j["ignore_eos"] = true;
     CString output = CallGemma(aiImge, input);
     AfxMessageBox(output);
 }
