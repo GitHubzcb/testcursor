@@ -1,87 +1,74 @@
 // ===================================================================
 //  OnBnClickedButtonAitrain_patch.cpp
 //
-//  本文件展示对 OnBnClickedButtonAitrain 函数中
-//  "数据收集" 和 "可视化" 两处的修改片段。
+//  本文件展示对 OnBnClickedButtonAitrain 函数中各处的修改片段。
 //  请将以下代码替换到原函数对应位置。
+//
+//  本次新增改动（正背面检测）标记为 ★★
 // ===================================================================
 
 // ---------------------------------------------------------------
-//  [修改1] allImages 的元素类型由
-//      std::map<CStringW, double>
-//  改为
-//      std::map<int, RegionTempStat>
-//  使其能携带完整统计信息（均值、最高、最低、标准差）。
-//  原声明替换如下：
-// ---------------------------------------------------------------
-
-//  旧代码：
-//      std::vector<std::map<CStringW, double>> allImages;
-//
-//  新代码：
-//      std::vector<std::map<int, RegionTempStat>> allImages;
-
-
-// ---------------------------------------------------------------
-//  [修改2] 循环末尾：收集当前图像统计数据
-//  原代码将 meanTemp 存入 map<CStringW, double>，
-//  新代码直接存储完整 RegionTempStat 对象。
-//
-//  替换以下旧代码段：
+//  [修改1] 变量声明（函数开头）
+//  新增 allFacings 列表，与 allImages 一一对应记录每张图的朝向。
 //
 //  旧：
-//      std::map<CStringW, double> imageData;
-//      for (auto& kv : regionStats)
-//      {
-//          ...imageData[regionName] = stat.meanTemp;
-//      }
-//      allImages.push_back(imageData);
+//      std::vector<std::map<CStringW, double>> allImages;
 //
 //  新：
-// ---------------------------------------------------------------
-/*
-    // 直接保存完整统计（含均值、最高、最低、标准差）
-    allImages.push_back(regionStats);
-*/
-
-
-// ---------------------------------------------------------------
-//  [修改3] 可视化：在图像上标注区域信息
-//  原代码只显示区域名 + meanTemp，
-//  新代码额外显示左右信息（区域名已包含"(左)"/"(右)"后缀）。
-//  RegionColor 数组大小同步扩展，此处只需保证 region < REGION_COUNT。
-//
-//  对应替换段（无需改动，仅需确保 BodyRegionName 已更新）：
-//
-//      CString text;
-//      text.Format(
-//          "%s %.1fC",
-//          BodyRegionName[region],
-//          stat.meanTemp
-//      );
+//      std::vector<std::map<int, RegionTempStat>> allImages;
+//      std::vector<BodyFacing> allFacings;              // ★★ 新增
 // ---------------------------------------------------------------
 
 
 // ---------------------------------------------------------------
-//  [修改4] 提示词构建：替换原来的 input 构建逻辑
+//  [修改2] 循环内：BuildBodyRegionMask 调用
 //
-//  旧（仅输出均值）：
-//      for (auto& kv : allImages[i])
-//          tmp.Format(L"  %ls：%.1f℃\n", kv.first, kv.second);
+//  旧：
+//      cv::Mat bodyRegionMask = BuildBodyRegionMask(person, image.cols, image.rows);
 //
-//  新：调用 BuildLLMPrompt，自动生成左右、差值、标准差格式的提示词：
+//  新：
+//      BodyFacing facing;                               // ★★ 新增
+//      cv::Mat bodyRegionMask = BuildBodyRegionMask(person, image.cols, image.rows, facing);
 // ---------------------------------------------------------------
-/*
-    std::wstring promptW = BuildLLMPrompt(allImages);
-    CStringW input(promptW.c_str());
-    CString output = CallGemma(aiImge, input);
-    AfxMessageBox(output);
-*/
+
+
+// ---------------------------------------------------------------
+//  [修改3] 循环内：可视化文字改用 GetRegionName
+//  使背面图像显示"背部"而非"胸部"等正面名称。
+//
+//  旧：
+//      text.Format("%s %.1fC(±%.1f)", CString(BodyRegionName[region]), ...);
+//
+//  新：
+//      text.Format("%s %.1fC(±%.1f)", CString(GetRegionName(region, facing)), ...); // ★★
+// ---------------------------------------------------------------
+
+
+// ---------------------------------------------------------------
+//  [修改4] 循环末尾：保存数据时同时保存朝向
+//
+//  旧：
+//      allImages.push_back(regionStats);
+//
+//  新：
+//      allImages.push_back(regionStats);
+//      allFacings.push_back(facing);                    // ★★ 新增
+// ---------------------------------------------------------------
+
+
+// ---------------------------------------------------------------
+//  [修改5] 提示词构建：传入 allFacings
+//
+//  旧：
+//      std::wstring promptW = BuildLLMPrompt(allImages);
+//
+//  新：
+//      std::wstring promptW = BuildLLMPrompt(allImages, allFacings);   // ★★
+// ---------------------------------------------------------------
 
 
 // ===================================================================
-//  完整替换后的 OnBnClickedButtonAitrain 核心循环（仅关键改动部分）
-//  供参考，可直接复制粘贴到原函数中。
+//  完整替换后的 OnBnClickedButtonAitrain 核心循环（供直接复制）
 // ===================================================================
 /*
 
@@ -90,14 +77,14 @@ void CThermal_Analysis_CAMDiagnosisDlg::OnBnClickedButtonAitrain()
     if (!g_poseSession) { MessageBox(_T("g_poseSession is nullptr!")); return; }
     if (!g_segSession)  { MessageBox(_T("g_segSession is nullptr!"));  return; }
 
-    // ★ 改为存储完整统计
     std::vector<std::map<int, RegionTempStat>> allImages;
+    std::vector<BodyFacing> allFacings;   // ★★ 新增
     cv::Mat aiImge;
 
     for (int i = 0; i < curNum; i++)
     {
-        cv::Mat& image        = Sadd2PatientInfo[i].img;
-        cv::Mat& image2tempt  = Sadd2PatientInfo[i].img;
+        cv::Mat& image       = Sadd2PatientInfo[i].img;
+        cv::Mat& image2tempt = Sadd2PatientInfo[i].img;
         if (image.empty()) continue;
 
         // --- 人体分割 ---
@@ -110,53 +97,67 @@ void CThermal_Analysis_CAMDiagnosisDlg::OnBnClickedButtonAitrain()
         image.copyTo(foreground, finalMask);
         aiImge = foreground;
 
-        // --- Pose 推理 ---
+        // --- Pose 推理（代码不变，略）---
         LetterBoxInfo lb;
         cv::Mat letterboxImg = LetterBox(foreground, 640, lb);
-        // ... (推理代码不变) ...
-        // std::vector<PosePerson> poses = PostProcessYOLOv8Pose(...);
+        // ... 推理、PostProcessYOLOv8Pose ...
         if (poses.empty()) continue;
 
-        // --- 可视化骨骼 ---
-        // ... (骨骼绘制代码不变) ...
+        // --- 可视化骨骼（代码不变，略）---
 
         PosePerson& person = poses[0];
         cv::Mat humanMask = finalMask;
 
-        // ★ 使用新版 BuildBodyRegionMask（已支持左右分侧）
-        cv::Mat bodyRegionMask = BuildBodyRegionMask(person, image.cols, image.rows);
+        // ★★ 调用新版 BuildBodyRegionMask，同时获取朝向
+        BodyFacing facing;
+        cv::Mat bodyRegionMask = BuildBodyRegionMask(
+            person, image.cols, image.rows, facing);
+
+        // ★★ 在图像左上角标注朝向文字，方便直观确认
+        {
+            CString facingText;
+            facingText.Format(_T("[%s]"), CString(BodyFacingName[facing]));
+            cv::putText(
+                image,
+                std::string(CT2A(facingText)),
+                cv::Point(8, 24),
+                cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                facing == FACING_FRONT  ? cv::Scalar(0, 255, 0)   // 绿 = 正面
+              : facing == FACING_BACK   ? cv::Scalar(0, 0, 255)   // 红 = 背面
+                                        : cv::Scalar(0, 200, 255),// 橙 = 未知
+                2, cv::LINE_AA
+            );
+        }
 
         // --- 温度统计 ---
-        // ★ 使用新版 CalcRegionTempFromMatrix（已支持标准差）
         auto regionStats = CalcRegionTempFromMatrix(
             Sadd2PatientInfo[i].tempbuf,
             bodyRegionMask,
             humanMask
         );
 
-        // ★ 存储完整统计（不再只存 meanTemp）
         allImages.push_back(regionStats);
+        allFacings.push_back(facing);    // ★★
 
-        // --- 可视化（标注最冷/最热点 + 区域名 + 均值）---
+        // --- 可视化（标注最冷/最热点 + 区域名（含正背面）+ 均值 + 标准差）---
         for (auto& kv : regionStats)
         {
             int region = kv.first;
             if (region <= 0 || region >= REGION_COUNT) continue;
             const RegionTempStat& stat = kv.second;
 
-            // 冷热点
             cv::circle(image, stat.minPt, 4, cv::Scalar(255, 0, 0), -1);
             cv::circle(image, stat.maxPt, 4, cv::Scalar(0, 0, 255), -1);
 
-            // 区域文字（含"(左)"/"(右)"后缀 + 均值 + 标准差）
             cv::Mat regionMaskSingle = (bodyRegionMask == region);
             cv::Rect bbox = cv::boundingRect(regionMaskSingle);
             if (bbox.area() <= 0) continue;
 
+            // ★★ 使用 GetRegionName 获取朝向感知的名称
             CString text;
             text.Format(
-                "%s %.1fC(±%.1f)",
-                CString(BodyRegionName[region]),
+                "%s %.1fC(\xB1%.1f)",
+                CString(GetRegionName(region, facing)),
                 stat.meanTemp,
                 stat.stdDev
             );
@@ -169,7 +170,7 @@ void CThermal_Analysis_CAMDiagnosisDlg::OnBnClickedButtonAitrain()
             );
         }
 
-        // --- 绘制轮廓（遍历所有新区域 ID）---
+        // --- 绘制轮廓 ---
         for (int r = REGION_HEAD; r < REGION_UNKNOWN; r++)
         {
             cv::Mat regionMaskSingle = (bodyRegionMask == r) & finalMask;
@@ -180,8 +181,8 @@ void CThermal_Analysis_CAMDiagnosisDlg::OnBnClickedButtonAitrain()
         }
     }
 
-    // ★ 使用新版提示词构建函数
-    std::wstring promptW = BuildLLMPrompt(allImages);
+    // ★★ BuildLLMPrompt 传入 allFacings
+    std::wstring promptW = BuildLLMPrompt(allImages, allFacings);
     CStringW input(promptW.c_str());
 
     CString output = CallGemma(aiImge, input);

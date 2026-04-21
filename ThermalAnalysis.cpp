@@ -5,6 +5,7 @@
 //    1. 区域左右分侧（大腿、小腿、膝盖、脚、胳膊、手）
 //    2. 温度统计新增标准差
 //    3. 提示词构建输出左右、差值、最高、最低、标准差
+//    4. 正背面朝向检测（DetectBodyFacing）
 // ===================================================================
 
 #include "ThermalAnalysis.h"
@@ -13,21 +14,94 @@
 #include <sstream>
 
 // ===================================================================
+//  DetectBodyFacing
+//
+//  基于 COCO-17 面部关键点置信度进行加权投票，判断人体朝向。
+//
+//  核心原理：
+//    正面朝相机时：鼻子、双眼可见，耳朵置信度较低（被面颊遮挡）。
+//    背面朝相机时：鼻子/眼睛消失（或置信度极低），耳朵轮廓反而可见。
+//    侧身：介于两者之间，单侧眼/耳可见。
+//
+//  加权得分规则（score > 0 → 正面，score < 0 → 背面）：
+//    +3.0  鼻子置信度  > 0.5
+//    +2.0  至少一只眼  > 0.4
+//    +1.0  双眼平均置信度 > 耳朵平均置信度
+//    -2.0  鼻子置信度  < 0.15（正面特征消失）
+//    -2.0  耳朵可见（≥0.4）且眼睛均不可见（<0.3）
+//    -1.5  耳朵平均置信度 > 眼睛平均置信度 + 0.2
+//    -1.0  耳朵总置信度 > 面部（鼻+眼）总置信度
+//
+//  判决阈值：
+//    score ≥  1.5 → FACING_FRONT
+//    score ≤ -1.0 → FACING_BACK
+//    其余          → FACING_UNKNOWN（侧身或关键点严重缺失）
+// ===================================================================
+BodyFacing DetectBodyFacing(const PosePerson& pose)
+{
+    const auto& kp = pose.keypoints;
+
+    float confNose  = kp[NOSE].conf;
+    float confLEye  = kp[L_EYE].conf;
+    float confREye  = kp[R_EYE].conf;
+    float confLEar  = kp[L_EAR].conf;
+    float confREar  = kp[R_EAR].conf;
+
+    float eyeAvg = (confLEye + confREye) * 0.5f;
+    float earAvg = (confLEar + confREar) * 0.5f;
+
+    float facialSum = confNose + confLEye + confREye;
+    float earSum    = confLEar + confREar;
+
+    bool noseVisible = confNose  > 0.5f;
+    bool anyEyeVis   = confLEye  > 0.4f || confREye > 0.4f;
+    bool anyEarVis   = confLEar  > 0.4f || confREar > 0.4f;
+    bool eyesHidden  = confLEye  < 0.3f && confREye < 0.3f;
+    bool noseMissing = confNose  < 0.15f;
+
+    float score = 0.f;
+
+    // ---- 正面证据 ----
+    if (noseVisible)  score += 3.0f;
+    if (anyEyeVis)    score += 2.0f;
+    if (eyeAvg > earAvg) score += 1.0f;
+
+    // ---- 背面证据 ----
+    if (noseMissing)              score -= 2.0f;
+    if (anyEarVis && eyesHidden)  score -= 2.0f;
+    if (earAvg > eyeAvg + 0.2f)  score -= 1.5f;
+    if (earSum > facialSum)       score -= 1.0f;
+
+    if (score >= 1.5f)  return FACING_FRONT;
+    if (score <= -1.0f) return FACING_BACK;
+    return FACING_UNKNOWN;
+}
+
+// ===================================================================
 //  BuildBodyRegionMask
-//  核心改动：利用人体中线（由左右关键点 x 坐标均值确定）
-//  将腿部、脚部、胳膊、手分配到左/右独立区域 ID。
+//  核心改动：
+//    1. 利用人体中线将腿部等区域分配到左/右独立 ID
+//    2. 自动检测正/背面（DetectBodyFacing），通过 outFacing 输出
+//       - 正面：CHEST=胸部，ABDOMEN=腹部（默认命名）
+//       - 背面：同样使用 CHEST/ABDOMEN 等区域 ID，但在显示层
+//               通过 GetRegionName(region, facing) 映射为"背部/腰背部"
+//         这样区域 ID 不变，温度统计逻辑不受影响；
+//         只有名称和提示词层感知朝向。
 //
 //  注意：COCO 关键点坐标系中，"左"关键点（L_HIP 等）在图像坐标中
 //  对应画面右侧（镜像），因此需要通过 x 坐标而非名称判断图像左右。
-//  此函数保留语义：用关键点坐标决定空间位置，每行像素按中线 x 划分。
 // ===================================================================
 cv::Mat BuildBodyRegionMask(
     const PosePerson& pose,
     int imgW,
-    int imgH
+    int imgH,
+    BodyFacing& outFacing   // 输出：检测到的正背面朝向
 )
 {
     cv::Mat mask(imgH, imgW, CV_8UC1, cv::Scalar(REGION_UNKNOWN));
+
+    // 首先检测正背面朝向
+    outFacing = DetectBodyFacing(pose);
 
     auto KP = [&](int id) -> cv::Point2f { return pose.keypoints[id].pt; };
     auto OK = [&](int id) -> bool        { return pose.keypoints[id].conf > 0.4f; };
@@ -330,8 +404,15 @@ static std::wstring FormatSideStat(
     return buf;
 }
 
+// ===================================================================
+//  BuildLLMPrompt
+//  改动：新增 facings 参数（与 allImages 一一对应），
+//        在每张图标题中标注"正面 / 背面 / 未知朝向"，
+//        轴对称区域名称根据朝向动态映射（背面→背部/腰背部等）。
+// ===================================================================
 std::wstring BuildLLMPrompt(
-    const std::vector<std::map<int, RegionTempStat>>& allImages
+    const std::vector<std::map<int, RegionTempStat>>& allImages,
+    const std::vector<BodyFacing>& facings          // 与 allImages 等长
 )
 {
     std::wstring prompt;
@@ -347,9 +428,17 @@ std::wstring BuildLLMPrompt(
     {
         const auto& stats = allImages[imgIdx];
 
-        wchar_t imgHeader[64];
+        // 取当前图像的朝向（若 facings 长度不足则默认 UNKNOWN）
+        BodyFacing facing = (imgIdx < facings.size())
+            ? facings[imgIdx]
+            : FACING_UNKNOWN;
+
+        // 图像标题 + 朝向标注
+        wchar_t imgHeader[128];
         swprintf_s(imgHeader, sizeof(imgHeader) / sizeof(wchar_t),
-            L"图像%zu：\n", imgIdx + 1);
+            L"图像%zu（%ls）：\n",
+            imgIdx + 1,
+            BodyFacingName[facing]);
         prompt += imgHeader;
 
         // ---- 对称配对区域（左右分侧）----
@@ -363,15 +452,11 @@ std::wstring BuildLLMPrompt(
 
             if (!hasL && !hasR) continue;
 
-            // 区域标题
             prompt += std::wstring(L"  ") + pair.name + L"：\n";
 
-            if (hasL)
-                prompt += FormatSideStat(L"左", itL->second);
-            if (hasR)
-                prompt += FormatSideStat(L"右", itR->second);
+            if (hasL) prompt += FormatSideStat(L"左", itL->second);
+            if (hasR) prompt += FormatSideStat(L"右", itR->second);
 
-            // 左右差值
             if (hasL && hasR)
             {
                 float diff = std::fabs(itL->second.meanTemp - itR->second.meanTemp);
@@ -379,35 +464,49 @@ std::wstring BuildLLMPrompt(
                 if (diff >= kLRDiffWarn)
                 {
                     swprintf_s(diffBuf, sizeof(diffBuf) / sizeof(wchar_t),
-                        L"  差值：%.1f℃  ⚠ 左右温差偏大，建议重点关注\n",
-                        diff);
+                        L"  差值：%.1f℃  ⚠ 左右温差偏大，建议重点关注\n", diff);
                 }
                 else
                 {
                     swprintf_s(diffBuf, sizeof(diffBuf) / sizeof(wchar_t),
-                        L"  差值：%.1f℃\n",
-                        diff);
+                        L"  差值：%.1f℃\n", diff);
                 }
                 prompt += diffBuf;
             }
         }
 
-        // ---- 轴对称单侧区域 ----
+        // ---- 轴对称区域（名称随朝向动态映射）----
         for (const auto& sr : kSingleRegions)
         {
             auto it = stats.find(sr.first);
             if (it == stats.end() || it->second.pixelCount == 0) continue;
 
             const RegionTempStat& s = it->second;
+            // 根据朝向选择区域名称
+            const wchar_t* regionLabel = GetRegionName(sr.first, facing);
+
             wchar_t buf[256];
             swprintf_s(buf, sizeof(buf) / sizeof(wchar_t),
                 L"  %ls：均值 %.1f℃  最高 %.1f℃  最低 %.1f℃  标准差 %.2f℃\n",
-                sr.second,
+                regionLabel,
                 s.meanTemp, s.maxTemp, s.minTemp, s.stdDev);
             prompt += buf;
         }
 
         prompt += L"\n";
+    }
+
+    // ---- 是否含背面图像，追加背面专项说明 ----
+    bool hasBack = false;
+    for (auto f : facings)
+        if (f == FACING_BACK) { hasBack = true; break; }
+
+    if (hasBack)
+    {
+        prompt +=
+            L"【背面图像说明】\n"
+            L"背面图像中"背部"对应正面的胸腔区域，"腰背部"对应正面的腹部，\n"
+            L""下背/臀部"对应正面的腰部，请结合临床背部热成像规律分析。\n\n";
     }
 
     // ---- 输出要求 ----

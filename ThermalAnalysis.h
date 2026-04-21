@@ -191,3 +191,87 @@ inline BodyVisibleType DetectBodyType(const PosePerson& pose)
     if (hasHip || hasKnee || hasAnkle) return LOWER_BODY;
     return UNKNOWN_BODY;
 }
+
+// ---------------------------------------------------------------
+//  正背面判断
+//
+//  算法：利用 COCO-17 面部关键点置信度进行加权投票。
+//
+//  正面证据（得分+）：
+//    - 鼻子(NOSE)置信度高         → 最强正面特征，权重3
+//    - 眼睛(L_EYE/R_EYE)可见      → 正面特征，权重2
+//    - 面部关键点总置信度 > 耳朵   → 正面倾向，权重1
+//
+//  背面证据（得分-）：
+//    - 鼻子置信度极低              → 正面特征消失，权重2
+//    - 耳朵可见但眼睛不可见        → 背面特征，权重2
+//    - 耳朵置信度明显高于眼睛      → 背面倾向，权重1.5
+//    - 耳朵总置信度 > 面部总置信度 → 背面倾向，权重1
+//
+//  判决：score ≥ 1.5 → 正面；score ≤ -1.0 → 背面；否则 → 未知（侧身）
+// ---------------------------------------------------------------
+enum BodyFacing
+{
+    FACING_FRONT,    // 正面
+    FACING_BACK,     // 背面
+    FACING_UNKNOWN   // 无法判断（侧身或关键点缺失）
+};
+
+// 正/背面名称，用于提示词和日志
+static const wchar_t* BodyFacingName[] =
+{
+    L"正面",
+    L"背面",
+    L"未知朝向"
+};
+
+BodyFacing DetectBodyFacing(const PosePerson& pose);
+
+// ---------------------------------------------------------------
+//  函数前向声明
+// ---------------------------------------------------------------
+
+// 构建身体区域 mask，同时输出正背面朝向
+cv::Mat BuildBodyRegionMask(
+    const PosePerson& pose,
+    int imgW,
+    int imgH,
+    BodyFacing& outFacing
+);
+
+// 温度统计（含标准差）
+std::map<int, RegionTempStat> CalcRegionTempFromMatrix(
+    const cv::Mat& tempMat,
+    const cv::Mat& regionMask,
+    const cv::Mat& humanMask
+);
+
+// 构建 LLM 提示词（含左右、标准差、正背面朝向）
+std::wstring BuildLLMPrompt(
+    const std::vector<std::map<int, RegionTempStat>>& allImages,
+    const std::vector<BodyFacing>& facings
+);
+
+// ---------------------------------------------------------------
+//  根据朝向返回区域中文名
+//  背面时 CHEST→背部、ABDOMEN→腰背部、WAIST→下背/臀部
+//  NECK/HEAD 也区分前后命名，其余区域名称不变。
+// ---------------------------------------------------------------
+inline const wchar_t* GetRegionName(int region, BodyFacing facing)
+{
+    if (facing == FACING_BACK)
+    {
+        switch (region)
+        {
+        case REGION_HEAD:    return L"后脑";
+        case REGION_NECK:    return L"颈后";
+        case REGION_CHEST:   return L"背部";
+        case REGION_ABDOMEN: return L"腰背部";
+        case REGION_WAIST:   return L"下背/臀部";
+        default: break;
+        }
+    }
+    if (region >= 0 && region < REGION_COUNT)
+        return BodyRegionName[region];
+    return L"Unknown";
+}
