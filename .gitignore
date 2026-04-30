@@ -1,6 +1,6 @@
 build/
 tests/test_infrared.png
-tests/output_temp.csv
-tests/output_heatmap.png
+tests/output_*.csv
+tests/output_*.png
 *.o
 *.d

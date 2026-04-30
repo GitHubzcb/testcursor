@@ -1,4 +1,6 @@
 #include <opencv2/opencv.hpp>
+#include <tesseract/baseapi.h>
+#include <leptonica/allheaders.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -6,6 +8,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <regex>
+#include <memory>
 
 struct ColorBarInfo {
     cv::Rect region;
@@ -13,8 +17,6 @@ struct ColorBarInfo {
 };
 
 // Auto-detect the color bar region on the right side of the image.
-// Strategy: scan from the right edge inward, looking for a narrow vertical
-// strip that exhibits a smooth color gradient from top to bottom.
 ColorBarInfo detectColorBar(const cv::Mat& image) {
     int h = image.rows;
     int w = image.cols;
@@ -22,12 +24,8 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
     cv::Mat lab;
     cv::cvtColor(image, lab, cv::COLOR_BGR2Lab);
 
-    // The color bar is typically in the rightmost 15% of the image.
-    // We look for a vertical region where each column has high color variance
-    // from top to bottom (gradient) but low variance across a narrow horizontal band.
     int searchStart = static_cast<int>(w * 0.75);
 
-    // Find the right boundary: skip pure black/white border pixels
     int rightBound = w - 1;
     for (int x = w - 1; x > searchStart; --x) {
         int nonBorderCount = 0;
@@ -43,7 +41,6 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
         }
     }
 
-    // Score each column by vertical color gradient magnitude
     struct ColScore {
         int x;
         double gradientScore;
@@ -83,7 +80,6 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
         scores.push_back({x, avgGrad, avgHoriz});
     }
 
-    // Find the region with high gradient and low horizontal variance
     int bestStart = -1, bestEnd = -1;
     double bestScore = -1;
 
@@ -115,12 +111,10 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
         }
     }
 
-    // Determine vertical extent of the color bar
     int topY = h / 8, bottomY = 7 * h / 8;
     if (bestStart >= 0) {
         int midX = (bestStart + bestEnd) / 2;
 
-        // Search upward for the start of the gradient
         for (int y = h / 2; y > 0; --y) {
             cv::Vec3b px = image.at<cv::Vec3b>(y, midX);
             int brightness = (px[0] + px[1] + px[2]) / 3;
@@ -129,7 +123,6 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
                 break;
             }
         }
-        // Search downward for the end
         for (int y = h / 2; y < h - 1; ++y) {
             cv::Vec3b px = image.at<cv::Vec3b>(y, midX);
             int brightness = (px[0] + px[1] + px[2]) / 3;
@@ -140,7 +133,6 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
         }
     }
 
-    // Fallback if detection failed: use rightmost 5% of image
     if (bestStart < 0) {
         std::cerr << "[Warning] Auto-detection of color bar failed, using default region (rightmost 5%)\n";
         bestStart = static_cast<int>(w * 0.93);
@@ -157,14 +149,12 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
     ColorBarInfo info;
     info.region = cv::Rect(bestStart, topY, bestEnd - bestStart + 1, bottomY - topY + 1);
 
-    // Sample colors along the color bar (top to bottom)
     int sampleCount = bottomY - topY + 1;
     info.labColors.resize(sampleCount);
 
     for (int y = topY; y <= bottomY; ++y) {
         cv::Vec3f avgColor(0, 0, 0);
         int count = 0;
-        // Average across the width of the color bar for noise reduction
         int margin = std::max(1, (bestEnd - bestStart + 1) / 4);
         for (int x = bestStart + margin; x <= bestEnd - margin; ++x) {
             cv::Vec3b c = lab.at<cv::Vec3b>(y, x);
@@ -184,8 +174,298 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
     return info;
 }
 
+// Extract a numeric value from OCR text using regex.
+// Returns all candidate numbers found in the text, sorted by likelihood.
+std::vector<double> extractNumbers(const std::string& text) {
+    std::vector<double> results;
+
+    std::string cleaned = text;
+    // Common OCR misreads
+    for (auto& c : cleaned) {
+        if (c == 'O' || c == 'o') c = '0';
+        if (c == 'l' || c == 'I') c = '1';
+        if (c == 'S' || c == 's') c = '5';
+        if (c == 'B') c = '8';
+        if (c == 'G') c = '6';
+        if (c == 'Z') c = '2';
+        if (c == 'D') c = '0';
+        if (c == 'q') c = '9';
+    }
+
+    std::regex numPattern(R"([-+]?\d+\.?\d*)");
+    auto it = std::sregex_iterator(cleaned.begin(), cleaned.end(), numPattern);
+    auto end = std::sregex_iterator();
+
+    for (; it != end; ++it) {
+        try {
+            double val = std::stod(it->str());
+            if (val > -200 && val < 10000) {
+                results.push_back(val);
+            }
+        } catch (...) {}
+    }
+    return results;
+}
+
+bool extractNumber(const std::string& text, double& value) {
+    auto nums = extractNumbers(text);
+    if (!nums.empty()) {
+        value = nums[0];
+        return true;
+    }
+    return false;
+}
+
+// Use Tesseract OCR to recognize temperature text near the color bar.
+// Searches above/below and to the right of the color bar for numeric labels.
+bool ocrTemperatureLabels(const cv::Mat& image, const ColorBarInfo& colorBar,
+                          double& maxTemp, double& minTemp) {
+    int barX = colorBar.region.x;
+    int barY = colorBar.region.y;
+    int barW = colorBar.region.width;
+    int barH = colorBar.region.height;
+    int barRight = barX + barW;
+    int barBottom = barY + barH;
+
+    int imgW = image.cols;
+    int imgH = image.rows;
+
+    // Initialize Tesseract
+    auto tess = std::make_unique<tesseract::TessBaseAPI>();
+    // Suppress Tesseract debug output
+    tess->SetVariable("debug_file", "/dev/null");
+
+    if (tess->Init(nullptr, "eng", tesseract::OEM_LSTM_ONLY) != 0) {
+        if (tess->Init(nullptr, "eng") != 0) {
+            std::cerr << "[Error] Failed to initialize Tesseract OCR\n";
+            return false;
+        }
+    }
+    // Restrict to digits, decimal point, minus sign
+    tess->SetVariable("tessedit_char_whitelist", "0123456789.-+");
+    tess->SetPageSegMode(tesseract::PSM_SINGLE_LINE);
+
+    // Define candidate regions to search for temperature text.
+    // Strategy: look at several positions near the color bar top/bottom:
+    //   1. To the right of the color bar (most common layout)
+    //   2. Above/below the color bar
+    //   3. To the left of the color bar
+    struct SearchRegion {
+        cv::Rect roi;
+        bool isMax; // true = looking for max temp, false = looking for min temp
+        std::string label;
+        int priority; // lower = more likely location
+    };
+
+    int textHeight = std::max(25, barH / 12);
+    int textWidth = std::max(80, static_cast<int>(imgW * 0.15));
+
+    std::vector<SearchRegion> regions;
+
+    // Max temp candidates (near top of color bar)
+    // Right of bar, aligned with top — multiple vertical offsets
+    if (barRight + 2 < imgW) {
+        int x1 = barRight + 2;
+        int x2 = std::min(imgW, x1 + textWidth);
+        // Slightly above bar top
+        int y1 = std::max(0, barY - textHeight);
+        int y2 = std::min(imgH, barY + textHeight / 2);
+        regions.push_back({cv::Rect(x1, y1, x2 - x1, y2 - y1), true, "right-top-above", 1});
+        // Aligned with bar top
+        y1 = std::max(0, barY - 5);
+        y2 = std::min(imgH, barY + textHeight);
+        regions.push_back({cv::Rect(x1, y1, x2 - x1, y2 - y1), true, "right-top-aligned", 1});
+    }
+    // Above the color bar (wider region)
+    {
+        int x1 = std::max(0, barX - 20);
+        int x2 = std::min(imgW, barRight + textWidth + 20);
+        int y1 = std::max(0, barY - textHeight * 2);
+        int y2 = barY;
+        if (y2 > y1 + 5)
+            regions.push_back({cv::Rect(x1, y1, x2 - x1, y2 - y1), true, "above-bar", 2});
+    }
+    // Left of bar, aligned with top
+    if (barX > 30) {
+        int x1 = std::max(0, barX - textWidth - 5);
+        int x2 = barX - 2;
+        int y1 = std::max(0, barY - textHeight / 2);
+        int y2 = std::min(imgH, barY + textHeight);
+        regions.push_back({cv::Rect(x1, y1, x2 - x1, y2 - y1), true, "left-top", 3});
+    }
+
+    // Min temp candidates (near bottom of color bar)
+    // Right of bar, aligned with bottom — multiple vertical offsets
+    if (barRight + 2 < imgW) {
+        int x1 = barRight + 2;
+        int x2 = std::min(imgW, x1 + textWidth);
+        // Slightly below bar bottom
+        int y1 = std::max(0, barBottom - textHeight / 2);
+        int y2 = std::min(imgH, barBottom + textHeight);
+        regions.push_back({cv::Rect(x1, y1, x2 - x1, y2 - y1), false, "right-bottom-below", 1});
+        // Aligned with bar bottom
+        y1 = std::max(0, barBottom - textHeight);
+        y2 = std::min(imgH, barBottom + 5);
+        regions.push_back({cv::Rect(x1, y1, x2 - x1, y2 - y1), false, "right-bottom-aligned", 1});
+    }
+    // Below the color bar
+    {
+        int x1 = std::max(0, barX - 20);
+        int x2 = std::min(imgW, barRight + textWidth + 20);
+        int y1 = barBottom;
+        int y2 = std::min(imgH, barBottom + textHeight * 2);
+        if (y2 > y1 + 5)
+            regions.push_back({cv::Rect(x1, y1, x2 - x1, y2 - y1), false, "below-bar", 2});
+    }
+    // Left of bar, aligned with bottom
+    if (barX > 30) {
+        int x1 = std::max(0, barX - textWidth - 5);
+        int x2 = barX - 2;
+        int y1 = std::max(0, barBottom - textHeight);
+        int y2 = std::min(imgH, barBottom + textHeight / 2);
+        regions.push_back({cv::Rect(x1, y1, x2 - x1, y2 - y1), false, "left-bottom", 3});
+    }
+
+    // Collect all candidate detections
+    struct OcrCandidate {
+        double value;
+        int confidence;
+        bool isMax;
+        std::string label;
+        int priority; // lower = better position (right > above > left)
+    };
+    std::vector<OcrCandidate> candidates;
+
+    int regionIdx = 0;
+    for (const auto& sr : regions) {
+        ++regionIdx;
+        if (sr.roi.width <= 0 || sr.roi.height <= 0) continue;
+        if (sr.roi.x < 0 || sr.roi.y < 0) continue;
+        if (sr.roi.x + sr.roi.width > imgW || sr.roi.y + sr.roi.height > imgH) continue;
+
+        cv::Mat roi = image(sr.roi);
+
+        cv::Mat gray;
+        cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
+
+        // Upscale small regions for better OCR accuracy
+        int scale = 1;
+        if (gray.rows < 30) scale = 4;
+        else if (gray.rows < 50) scale = 3;
+        else if (gray.rows < 80) scale = 2;
+
+        if (scale > 1) {
+            cv::resize(gray, gray, cv::Size(), scale, scale, cv::INTER_CUBIC);
+        }
+
+        int priority = sr.priority;
+
+        // Multiple binarization strategies
+        std::vector<cv::Mat> binaries;
+
+        // Otsu threshold and its inverse
+        cv::Mat otsu;
+        cv::threshold(gray, otsu, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+        binaries.push_back(otsu);
+        cv::Mat otsuInv;
+        cv::bitwise_not(otsu, otsuInv);
+        binaries.push_back(otsuInv);
+
+        // Adaptive threshold
+        if (gray.rows >= 15 && gray.cols >= 15) {
+            cv::Mat adaptive;
+            int blockSize = std::max(3, (gray.rows / 4) | 1); // ensure odd
+            cv::adaptiveThreshold(gray, adaptive, 255,
+                                  cv::ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv::THRESH_BINARY, blockSize, 5);
+            binaries.push_back(adaptive);
+            cv::Mat adaptiveInv;
+            cv::bitwise_not(adaptive, adaptiveInv);
+            binaries.push_back(adaptiveInv);
+        }
+
+        // Fixed threshold for white-on-black text
+        cv::Mat fixedThresh;
+        cv::threshold(gray, fixedThresh, 128, 255, cv::THRESH_BINARY);
+        binaries.push_back(fixedThresh);
+        cv::Mat fixedInv;
+        cv::bitwise_not(fixedThresh, fixedInv);
+        binaries.push_back(fixedInv);
+
+        for (auto& processed : binaries) {
+            // Morphological cleanup
+            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(2, 2));
+            cv::Mat cleaned;
+            cv::morphologyEx(processed, cleaned, cv::MORPH_CLOSE, kernel);
+
+            // Add padding
+            int pad = 15;
+            cv::Mat padded;
+            cv::copyMakeBorder(cleaned, padded, pad, pad, pad, pad,
+                               cv::BORDER_CONSTANT, cv::Scalar(255));
+
+            tess->SetImage(padded.data, padded.cols, padded.rows, 1, padded.step);
+            tess->Recognize(0);
+
+            const char* text = tess->GetUTF8Text();
+            int confidence = tess->MeanTextConf();
+
+            if (text && strlen(text) > 0 && confidence > 0) {
+                std::string ocrText(text);
+                auto nums = extractNumbers(ocrText);
+                for (double value : nums) {
+                    // Skip zero or very small values (likely noise)
+                    if (std::abs(value) < 0.01) continue;
+                    candidates.push_back({value, confidence, sr.isMax, sr.label, priority});
+                }
+            }
+            delete[] text;
+        }
+    }
+
+    tess->End();
+
+    // Select best max/min from candidates using a scoring function:
+    // - Higher confidence is better
+    // - Lower priority (better positioned region) is better
+    // - Non-zero values preferred
+    auto score = [](const OcrCandidate& c) -> double {
+        return c.confidence * 10.0 / c.priority;
+    };
+
+    bool foundMax = false, foundMin = false;
+    double bestMaxScore = -1, bestMinScore = -1;
+
+    for (const auto& c : candidates) {
+        double s = score(c);
+        if (c.isMax && s > bestMaxScore) {
+            maxTemp = c.value;
+            foundMax = true;
+            bestMaxScore = s;
+        } else if (!c.isMax && s > bestMinScore) {
+            minTemp = c.value;
+            foundMin = true;
+            bestMinScore = s;
+        }
+    }
+
+    if (foundMax) {
+        std::cout << "  [OCR] Max temp: " << maxTemp << "\n";
+    }
+    if (foundMin) {
+        std::cout << "  [OCR] Min temp: " << minTemp << "\n";
+    }
+
+    // Ensure max > min; swap if OCR got them reversed
+    if (foundMax && foundMin && maxTemp < minTemp) {
+        std::swap(maxTemp, minTemp);
+        std::cout << "  [OCR] Swapped max/min (max was less than min)\n";
+    }
+
+    return foundMax && foundMin;
+}
+
 // Find the temperature for a given pixel color by matching against the color bar.
-// Returns a temperature linearly interpolated between maxTemp (top) and minTemp (bottom).
 double findTemperature(const cv::Vec3f& pixelLab,
                        const std::vector<cv::Vec3f>& barColors,
                        double maxTemp, double minTemp) {
@@ -196,7 +476,6 @@ double findTemperature(const cv::Vec3f& pixelLab,
         double dL = pixelLab[0] - barColors[i][0];
         double da = pixelLab[1] - barColors[i][1];
         double db = pixelLab[2] - barColors[i][2];
-        // CIE76 Delta-E
         double dist = dL * dL + da * da + db * db;
         if (dist < bestDist) {
             bestDist = dist;
@@ -204,7 +483,6 @@ double findTemperature(const cv::Vec3f& pixelLab,
         }
     }
 
-    // Linear interpolation: top (index 0) -> maxTemp, bottom (last index) -> minTemp
     double ratio = static_cast<double>(bestIdx) / std::max(1, (int)barColors.size() - 1);
     return maxTemp - ratio * (maxTemp - minTemp);
 }
@@ -252,11 +530,11 @@ private:
 
 void printUsage(const char* programName) {
     std::cout << "Usage: " << programName
-              << " <image_path> <max_temp> <min_temp> [options]\n\n"
-              << "Required arguments:\n"
+              << " <image_path> [max_temp min_temp] [options]\n\n"
+              << "Arguments:\n"
               << "  image_path     Path to the infrared pseudo-color image\n"
-              << "  max_temp       Maximum temperature (top of color bar)\n"
-              << "  min_temp       Minimum temperature (bottom of color bar)\n\n"
+              << "  max_temp       Maximum temperature (top of color bar) [auto-detected via OCR if omitted]\n"
+              << "  min_temp       Minimum temperature (bottom of color bar) [auto-detected via OCR if omitted]\n\n"
               << "Options:\n"
               << "  --bar-x1 N     Color bar left x coordinate (manual override)\n"
               << "  --bar-x2 N     Color bar right x coordinate\n"
@@ -265,20 +543,47 @@ void printUsage(const char* programName) {
               << "  --output-csv FILE   Output temperature matrix as CSV\n"
               << "  --output-img FILE   Output temperature heatmap as image\n"
               << "  --show              Display result in a window\n"
-              << "  --exclude-bar       Exclude the color bar region from output\n\n"
-              << "Example:\n"
-              << "  " << programName << " thermal.jpg 45.2 22.1 --output-csv temp.csv --output-img result.png\n";
+              << "  --exclude-bar       Exclude the color bar region from output\n"
+              << "  --no-ocr            Disable OCR auto-detection (requires manual temp input)\n\n"
+              << "Examples:\n"
+              << "  # Fully automatic (OCR detects temperature range):\n"
+              << "  " << programName << " thermal.jpg --output-csv temp.csv\n\n"
+              << "  # Manual temperature input:\n"
+              << "  " << programName << " thermal.jpg 45.2 22.1 --output-csv temp.csv\n";
 }
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
+    if (argc < 2) {
         printUsage(argv[0]);
         return 1;
     }
 
     std::string imagePath = argv[1];
-    double maxTemp = std::atof(argv[2]);
-    double minTemp = std::atof(argv[3]);
+    double maxTemp = 0, minTemp = 0;
+    bool tempProvided = false;
+    bool noOcr = false;
+
+    // Determine if second argument is a number (temperature) or an option.
+    // A numeric argument starts with a digit, or '-'/'+' followed by a digit.
+    int optStart = 2;
+    if (argc >= 4) {
+        std::string arg2 = argv[2];
+        bool isNumeric = false;
+        if (!arg2.empty()) {
+            if (std::isdigit(static_cast<unsigned char>(arg2[0]))) {
+                isNumeric = true;
+            } else if ((arg2[0] == '-' || arg2[0] == '+') && arg2.size() > 1
+                       && std::isdigit(static_cast<unsigned char>(arg2[1]))) {
+                isNumeric = true;
+            }
+        }
+        if (isNumeric) {
+            maxTemp = std::atof(argv[2]);
+            minTemp = std::atof(argv[3]);
+            tempProvided = true;
+            optStart = 4;
+        }
+    }
 
     // Parse optional arguments
     int barX1 = -1, barX2 = -1, barY1 = -1, barY2 = -1;
@@ -286,7 +591,7 @@ int main(int argc, char** argv) {
     bool showWindow = false;
     bool excludeBar = false;
 
-    for (int i = 4; i < argc; ++i) {
+    for (int i = optStart; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--bar-x1" && i + 1 < argc) barX1 = std::atoi(argv[++i]);
         else if (arg == "--bar-x2" && i + 1 < argc) barX2 = std::atoi(argv[++i]);
@@ -296,11 +601,7 @@ int main(int argc, char** argv) {
         else if (arg == "--output-img" && i + 1 < argc) outputImg = argv[++i];
         else if (arg == "--show") showWindow = true;
         else if (arg == "--exclude-bar") excludeBar = true;
-    }
-
-    if (maxTemp <= minTemp) {
-        std::cerr << "[Error] max_temp must be greater than min_temp\n";
-        return 1;
+        else if (arg == "--no-ocr") noOcr = true;
     }
 
     // Load image
@@ -311,7 +612,6 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Image loaded: " << image.cols << " x " << image.rows << "\n";
-    std::cout << "Temperature range: " << minTemp << " ~ " << maxTemp << "\n";
 
     // Detect or use specified color bar region
     ColorBarInfo colorBar;
@@ -349,6 +649,33 @@ int main(int argc, char** argv) {
               << colorBar.region.y << ", "
               << colorBar.region.y + colorBar.region.height - 1 << "]\n";
     std::cout << "Color bar samples: " << colorBar.labColors.size() << "\n";
+
+    // Auto-detect temperature range via OCR if not provided
+    if (!tempProvided) {
+        if (noOcr) {
+            std::cerr << "[Error] Temperature range not provided and OCR is disabled.\n"
+                      << "  Please provide max_temp and min_temp as arguments, or remove --no-ocr.\n";
+            return 1;
+        }
+
+        std::cout << "Auto-detecting temperature range via OCR...\n";
+        bool ocrSuccess = ocrTemperatureLabels(image, colorBar, maxTemp, minTemp);
+        if (!ocrSuccess) {
+            std::cerr << "[Error] OCR failed to detect temperature labels.\n"
+                      << "  Please provide max_temp and min_temp as command-line arguments.\n"
+                      << "  Example: " << argv[0] << " " << imagePath << " 45.2 22.1\n";
+            return 1;
+        }
+        std::cout << "OCR detected temperature range: " << minTemp << " ~ " << maxTemp << "\n";
+    } else {
+        std::cout << "Temperature range (user-provided): " << minTemp << " ~ " << maxTemp << "\n";
+    }
+
+    if (maxTemp <= minTemp) {
+        std::cerr << "[Error] max_temp (" << maxTemp << ") must be greater than min_temp ("
+                  << minTemp << ")\n";
+        return 1;
+    }
 
     // Convert the full image to Lab color space
     cv::Mat labImage;
@@ -421,14 +748,12 @@ int main(int argc, char** argv) {
         cv::Mat heatmap;
         cv::applyColorMap(normalized, heatmap, cv::COLORMAP_JET);
 
-        // Add temperature scale text
         int barWidth = 40;
         int padding = 10;
         cv::Mat result(heatmap.rows, heatmap.cols + barWidth + padding * 2 + 60, CV_8UC3,
                        cv::Scalar(0, 0, 0));
         heatmap.copyTo(result(cv::Rect(0, 0, heatmap.cols, heatmap.rows)));
 
-        // Draw a color bar on the result
         for (int y = 0; y < heatmap.rows; ++y) {
             double temp = maxTemp - (double)y / (heatmap.rows - 1) * (maxTemp - minTemp);
             uchar val = static_cast<uchar>(255.0 * (temp - minTemp) / (maxTemp - minTemp));
@@ -442,7 +767,6 @@ int main(int argc, char** argv) {
                      cv::Scalar(color[0], color[1], color[2]), 1);
         }
 
-        // Add temperature labels
         auto addLabel = [&](int y, double temp) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%.1f", temp);

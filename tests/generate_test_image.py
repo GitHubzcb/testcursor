@@ -5,10 +5,10 @@ import os
 
 H, W = 480, 640
 BAR_WIDTH = 30
-BAR_LEFT = W - 50
+BAR_LEFT = W - 80
 BAR_RIGHT = BAR_LEFT + BAR_WIDTH
-BAR_TOP = 40
-BAR_BOTTOM = H - 40
+BAR_TOP = 50
+BAR_BOTTOM = H - 50
 
 MIN_TEMP = 20.0
 MAX_TEMP = 50.0
@@ -26,7 +26,7 @@ temp_field = np.clip(temp_field, MIN_TEMP, MAX_TEMP)
 # Map temperature to [0, 255] and apply JET colormap
 norm = ((temp_field - MIN_TEMP) / (MAX_TEMP - MIN_TEMP) * 255).astype(np.uint8)
 colored = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
-image[:, :BAR_LEFT - 10] = colored[:, :BAR_LEFT - 10]
+image[:, :BAR_LEFT - 20] = colored[:, :BAR_LEFT - 20]
 
 # Draw the color bar on the right side
 for y in range(BAR_TOP, BAR_BOTTOM + 1):
@@ -36,18 +36,21 @@ for y in range(BAR_TOP, BAR_BOTTOM + 1):
     color = pix[0, 0]
     image[y, BAR_LEFT:BAR_RIGHT] = color
 
-# Add text for max/min temp
-cv2.putText(image, f"{MAX_TEMP:.1f}", (BAR_RIGHT + 5, BAR_TOP + 15),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-cv2.putText(image, f"{MIN_TEMP:.1f}", (BAR_RIGHT + 5, BAR_BOTTOM + 5),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+# Add text for max/min temp with larger font for better OCR
+cv2.putText(image, f"{MAX_TEMP:.1f}", (BAR_RIGHT + 8, BAR_TOP + 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+cv2.putText(image, f"{MIN_TEMP:.1f}", (BAR_RIGHT + 8, BAR_BOTTOM + 8),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
 out_dir = os.path.dirname(os.path.abspath(__file__))
 out_path = os.path.join(out_dir, "test_infrared.png")
 cv2.imwrite(out_path, image)
 print(f"Test image saved to {out_path} ({W}x{H})")
+print(f"Color bar region: x=[{BAR_LEFT}, {BAR_RIGHT}], y=[{BAR_TOP}, {BAR_BOTTOM}]")
+print(f"Max temp text position: ({BAR_RIGHT + 8}, {BAR_TOP + 5})")
+print(f"Min temp text position: ({BAR_RIGHT + 8}, {BAR_BOTTOM + 8})")
 
-# Also save the ground truth temperature for the center pixel
+# Ground truth temperatures
 center_temp = temp_field[H // 2, W // 2]
 print(f"Center pixel temperature (ground truth): {center_temp:.2f}")
 print(f"Top-left quarter temperature (ground truth): {temp_field[H//4, W//4]:.2f}")
