@@ -21,10 +21,165 @@ struct ColorBarInfo {
 
 // ============================================================================
 // Built-in digit recognizer (no external dependency, only OpenCV required)
-// Uses connected component analysis + structural feature classification.
+// Primary: Template matching against multiple built-in font templates.
+// Fallback: Structural feature classification.
 // ============================================================================
 
 class BuiltinDigitRecognizer {
+private:
+    // Normalized digit templates (generated once, cached as static)
+    static const int TMPL_H = 32;
+    static const int TMPL_W = 20;
+
+    struct TemplateSet {
+        cv::Mat templates[10]; // digits 0-9, each TMPL_H x TMPL_W, CV_8U
+        bool initialized = false;
+    };
+
+    // Generate templates using OpenCV built-in fonts
+    static std::vector<TemplateSet>& getTemplateSets() {
+        static std::vector<TemplateSet> sets;
+        if (!sets.empty()) return sets;
+
+        // Use multiple OpenCV font faces for broader coverage
+        int fonts[] = {
+            cv::FONT_HERSHEY_SIMPLEX,
+            cv::FONT_HERSHEY_DUPLEX,
+            cv::FONT_HERSHEY_COMPLEX,
+            cv::FONT_HERSHEY_TRIPLEX,
+            cv::FONT_HERSHEY_PLAIN,
+        };
+        double scales[] = {1.5, 2.0, 1.0};
+        int thicknesses[] = {2, 3, 1};
+
+        for (int font : fonts) {
+            for (double scale : scales) {
+                for (int thick : thicknesses) {
+                    TemplateSet ts;
+                    bool valid = true;
+                    for (int d = 0; d <= 9; ++d) {
+                        std::string ch(1, '0' + d);
+                        int baseline = 0;
+                        cv::Size textSize = cv::getTextSize(ch, font, scale, thick, &baseline);
+
+                        if (textSize.width < 3 || textSize.height < 5) {
+                            valid = false;
+                            break;
+                        }
+
+                        // Render on a tight canvas
+                        int canvasH = textSize.height + baseline + 6;
+                        int canvasW = textSize.width + 6;
+                        cv::Mat canvas(canvasH, canvasW, CV_8U, cv::Scalar(0));
+                        cv::putText(canvas, ch, cv::Point(3, textSize.height + 3),
+                                    font, scale, cv::Scalar(255), thick);
+
+                        // Crop to tight bounding box
+                        std::vector<cv::Point> nonzero;
+                        cv::findNonZero(canvas, nonzero);
+                        if (nonzero.empty()) { valid = false; break; }
+                        cv::Rect bbox = cv::boundingRect(nonzero);
+                        cv::Mat cropped = canvas(bbox);
+
+                        // Resize to standard template size
+                        cv::Mat resized;
+                        cv::resize(cropped, resized, cv::Size(TMPL_W, TMPL_H), 0, 0, cv::INTER_AREA);
+                        cv::threshold(resized, ts.templates[d], 64, 255, cv::THRESH_BINARY);
+                    }
+                    if (valid) {
+                        ts.initialized = true;
+                        sets.push_back(ts);
+                    }
+                }
+            }
+        }
+        return sets;
+    }
+
+    // Match a character image against all templates, return best match
+    static char templateMatch(const cv::Mat& charImg) {
+        if (charImg.empty()) return '?';
+
+        // Resize input to template size
+        cv::Mat resized;
+        cv::resize(charImg, resized, cv::Size(TMPL_W, TMPL_H), 0, 0, cv::INTER_AREA);
+        cv::threshold(resized, resized, 64, 255, cv::THRESH_BINARY);
+
+        auto& sets = getTemplateSets();
+        if (sets.empty()) return '?';
+
+        char bestChar = '?';
+        double bestScore = -1.0;
+
+        for (auto& ts : sets) {
+            if (!ts.initialized) continue;
+            for (int d = 0; d <= 9; ++d) {
+                // Normalized cross-correlation (pixel overlap ratio)
+                cv::Mat andResult, orResult;
+                cv::bitwise_and(resized, ts.templates[d], andResult);
+                cv::bitwise_or(resized, ts.templates[d], orResult);
+
+                int intersect = cv::countNonZero(andResult);
+                int unionPixels = cv::countNonZero(orResult);
+
+                // IoU (Intersection over Union) as similarity score
+                double iou = unionPixels > 0 ?
+                    static_cast<double>(intersect) / unionPixels : 0;
+
+                if (iou > bestScore) {
+                    bestScore = iou;
+                    bestChar = '0' + d;
+                }
+            }
+        }
+
+        // Only accept if confidence is reasonable
+        if (bestScore > 0.35) {
+            return bestChar;
+        }
+        return '?';
+    }
+
+    // Structural feature fallback for when template matching is uncertain
+    static char structuralFallback(const cv::Mat& charImg) {
+        if (charImg.empty()) return '?';
+        int h = charImg.rows;
+        int w = charImg.cols;
+        float aspectRatio = static_cast<float>(w) / h;
+
+        std::vector<std::vector<cv::Point>> contours;
+        std::vector<cv::Vec4i> hierarchy;
+        cv::findContours(charImg.clone(), contours, hierarchy,
+                         cv::RETR_CCOMP, cv::CHAIN_APPROX_SIMPLE);
+
+        int holes = 0;
+        for (size_t i = 0; i < contours.size(); ++i) {
+            if (hierarchy[i][3] >= 0) ++holes;
+        }
+
+        float density = static_cast<float>(cv::countNonZero(charImg)) / (w * h);
+
+        if (holes >= 2) return '8';
+        if (holes == 1) {
+            // Find hole center
+            int holeCenterY = h / 2;
+            for (size_t i = 0; i < contours.size(); ++i) {
+                if (hierarchy[i][3] >= 0) {
+                    cv::Moments m = cv::moments(contours[i]);
+                    if (m.m00 > 0) holeCenterY = static_cast<int>(m.m01 / m.m00);
+                    break;
+                }
+            }
+            float holeRelY = static_cast<float>(holeCenterY) / h;
+            if (holeRelY > 0.35 && holeRelY < 0.65) return '0';
+            if (holeRelY > 0.5) return '6';
+            return '9';
+        }
+        if (aspectRatio < 0.35) return '1';
+        if (density > 0.55 && aspectRatio > 0.5) return '0';
+        return '?';
+    }
+
 public:
     // Recognize a single digit/character from a binary image (white char on black bg)
     static char recognizeChar(const cv::Mat& charImg) {
@@ -33,185 +188,19 @@ public:
         int h = charImg.rows;
         int w = charImg.cols;
         float aspectRatio = static_cast<float>(w) / h;
+        float density = static_cast<float>(cv::countNonZero(charImg)) / (w * h);
 
-        // Very narrow and small — likely a dot or minus
+        // Quick checks for non-digit characters
         if (h <= 4 && w <= 4) return '.';
-        if (aspectRatio > 2.0 && h < w / 2) return '-';
+        if (aspectRatio > 2.0 && density > 0.4 && h < w * 0.7) return '-';
+        if (w < 6 && h < 6 && density > 0.3) return '.';
 
-        // Dot: small, roughly square, in the lower portion
-        if (w <= h / 3 && h <= 8) return '.';
-        if (aspectRatio > 0.5 && aspectRatio < 2.0 && h < 8 && w < 8) return '.';
+        // Primary: template matching
+        char tmplResult = templateMatch(charImg);
+        if (tmplResult != '?') return tmplResult;
 
-        // Count contours (external and holes)
-        std::vector<std::vector<cv::Point>> contours;
-        std::vector<cv::Vec4i> hierarchy;
-        cv::findContours(charImg.clone(), contours, hierarchy,
-                         cv::RETR_CCOMP, cv::CHAIN_APPROX_SIMPLE);
-
-        int externalContours = 0;
-        int holes = 0;
-        for (size_t i = 0; i < contours.size(); ++i) {
-            if (hierarchy[i][3] < 0) {
-                ++externalContours;
-            } else {
-                ++holes;
-            }
-        }
-
-        // Compute pixel density
-        int totalPixels = cv::countNonZero(charImg);
-        float density = static_cast<float>(totalPixels) / (w * h);
-
-        // Horizontal and vertical projections
-        std::vector<int> hProj(h, 0), vProj(w, 0);
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                if (charImg.at<uchar>(y, x) > 0) {
-                    hProj[y]++;
-                    vProj[x]++;
-                }
-            }
-        }
-
-        // Analyze regions
-        int topThird = h / 3;
-        int midY = h / 2;
-        int botThird = 2 * h / 3;
-        int midX = w / 2;
-
-        auto countRegion = [&](int y1, int y2, int x1, int x2) -> int {
-            int count = 0;
-            y1 = std::max(0, y1); y2 = std::min(h, y2);
-            x1 = std::max(0, x1); x2 = std::min(w, x2);
-            for (int y = y1; y < y2; ++y)
-                for (int x = x1; x < x2; ++x)
-                    if (charImg.at<uchar>(y, x) > 0) ++count;
-            return count;
-        };
-
-        int topLeft = countRegion(0, topThird, 0, midX);
-        int topRight = countRegion(0, topThird, midX, w);
-        int midLeft = countRegion(topThird, botThird, 0, midX);
-        int midRight = countRegion(topThird, botThird, midX, w);
-        int botLeft = countRegion(botThird, h, 0, midX);
-        int botRight = countRegion(botThird, h, midX, w);
-
-        int topRow = countRegion(0, std::max(1, h / 6), 0, w);
-        int midRow = countRegion(midY - h / 8, midY + h / 8, 0, w);
-        int botRow = countRegion(h - std::max(1, h / 6), h, 0, w);
-
-        // Center horizontal line presence
-        int centerHLine = countRegion(midY - h / 10, midY + h / 10, w / 5, 4 * w / 5);
-        float centerHDensity = static_cast<float>(centerHLine) /
-            std::max(1, (2 * h / 10) * (3 * w / 5));
-
-        // Check for minus sign
-        if (aspectRatio > 1.5 && density > 0.5 && h < w * 0.7) return '-';
-
-        // Check for dot (small square blob)
-        if (w < 6 && h < 6 && density > 0.4) return '.';
-
-        // Digits with 2 holes: 8
-        if (holes >= 2) return '8';
-
-        // Digits with 1 hole: 0, 4, 6, 9
-        if (holes == 1) {
-            // 0: hole roughly centered, high density all around
-            // 4: hole in top-right area, open at top
-            // 6: hole in bottom half
-            // 9: hole in top half
-
-            // Find hole location
-            int holeCenterY = -1;
-            for (size_t i = 0; i < contours.size(); ++i) {
-                if (hierarchy[i][3] >= 0) {
-                    cv::Moments m = cv::moments(contours[i]);
-                    if (m.m00 > 0) {
-                        holeCenterY = static_cast<int>(m.m01 / m.m00);
-                    }
-                    break;
-                }
-            }
-
-            if (holeCenterY >= 0) {
-                float holeRelY = static_cast<float>(holeCenterY) / h;
-
-                // 4: open at top, hole in upper portion, aspect usually narrower
-                if (holeRelY < 0.45 && topLeft < topRight * 0.5 && botRow > topRow) {
-                    return '4';
-                }
-                // 0: hole centered
-                if (holeRelY > 0.35 && holeRelY < 0.65 && aspectRatio > 0.4 && aspectRatio < 0.85) {
-                    return '0';
-                }
-                // 6: hole in bottom half
-                if (holeRelY > 0.5) {
-                    return '6';
-                }
-                // 9: hole in top half
-                if (holeRelY <= 0.5) {
-                    return '9';
-                }
-            }
-            // Fallback: use density pattern
-            if (botLeft > topLeft * 1.3 && botRight > topRight * 0.8) return '6';
-            if (topLeft > botLeft * 1.3 || topRight > botRight * 1.3) return '9';
-            return '0';
-        }
-
-        // No holes: 1, 2, 3, 5, 7
-
-        // 1: very narrow aspect ratio AND uniform pixel distribution (straight line)
-        if (w <= 3 && h > 5) return '1';
-        if (aspectRatio < 0.35 && density > 0.5) {
-            // Distinguish '1' from narrow '0': '1' has uniform horizontal projection
-            int leftPixels = countRegion(0, h, 0, w / 3);
-            int rightPixels = countRegion(0, h, 2 * w / 3, w);
-            // '1' is centered/uniform; narrow '0' has more on edges
-            if (leftPixels < rightPixels * 2 && rightPixels < leftPixels * 2) {
-                return '1';
-            }
-            // If very narrow (aspect < 0.25), definitely '1'
-            if (aspectRatio < 0.25) return '1';
-        }
-
-        // 7: strong top row, weak mid/bottom-left, no center bar
-        if (topRow > botRow * 1.5 && midLeft < midRight && botLeft < botRight) {
-            if (centerHDensity < 0.35) return '7';
-        }
-
-        // 3: right side strong, left side weak in middle
-        if (midRight > midLeft * 2.0 && topRight > topLeft && botRight > botLeft) {
-            return '3';
-        }
-
-        // 2: bottom row is the strongest, top-right >= top-left, bottom-left >= bottom-right
-        // The '2' has a flat bottom stroke making botRow dominant
-        if (botRow > topRow && botRow > midRow && botLeft >= botRight * 0.9) {
-            if (topRight >= topLeft * 0.9) return '2';
-        }
-        // Alternative: top-right strong, bottom-left strong (S-shape)
-        if (topRight > topLeft && botLeft > botRight * 1.1) return '2';
-
-        // 5: top-left strong, bottom-right strong (reverse S-shape)
-        if (topLeft >= topRight && botRight > botLeft * 1.1) return '5';
-        // Alternative: flat top (topRow strong), curved bottom-right
-        if (topRow >= botRow * 0.8 && topLeft > topRight && botRight > botLeft) return '5';
-
-        // 3: multiple horizontal bars, weak left side
-        if (topRow > 0 && midRow > 0 && botRow > 0 && midLeft < midRight * 0.5) return '3';
-
-        // 7: diagonal from top-right to bottom-center
-        if (topRow > midRow * 1.3 && topRight > topLeft && centerHDensity < 0.3) return '7';
-
-        // 2: additional pattern (strong bottom with moderate density)
-        if (botRow > topRow * 1.2 && botRow > midRow && density > 0.4) return '2';
-
-        // Fallback
-        if (density > 0.55 && aspectRatio > 0.5) return '0';
-        if (aspectRatio < 0.4) return '1';
-
-        return '?';
+        // Fallback: structural features
+        return structuralFallback(charImg);
     }
 
     // Segment and recognize all characters in a binary image line.
