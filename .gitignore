@@ -5,3 +5,4 @@ tests/output_*.png
 *.o
 *.d
 tests/test_realistic.png
+tests/test_overlap.png

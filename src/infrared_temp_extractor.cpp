@@ -617,52 +617,63 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
         if (bestRunLen > h / 8) {
             topY = bestRunStart;
             bottomY = bestRunStart + bestRunLen - 1;
-            // Trim trailing/leading non-bar rows from gap allowance
             while (bottomY > topY && !isBarRow[bottomY]) --bottomY;
             while (topY < bottomY && !isBarRow[topY]) ++topY;
-            // Compensate for the window radius used in gradient detection:
-            // the first/last windowR rows cannot be detected, but they may still
-            // be part of the bar gradient. Extend outward only if the color change
-            // is small and consistent (same direction as the bar's gradient).
-            // Compute average gradient direction inside the bar for reference
-            cv::Vec3f refDir(0, 0, 0);
-            int midRange = (topY + bottomY) / 2;
-            int spanR = (bottomY - topY) / 4;
-            for (int y = midRange - spanR; y < midRange + spanR && y < h - 1; ++y) {
-                cv::Vec3f c1(lab.at<cv::Vec3b>(y, midX));
-                cv::Vec3f c2(lab.at<cv::Vec3b>(y + 1, midX));
-                refDir[0] += c2[0] - c1[0];
-                refDir[1] += c2[1] - c1[1];
-                refDir[2] += c2[2] - c1[2];
-            }
 
-            // Extend upward: color should keep changing in the same direction
-            for (int dy = 1; dy <= windowR + 2 && topY - 1 >= 0; ++dy) {
-                cv::Vec3f cPrev(lab.at<cv::Vec3b>(topY, midX));
-                cv::Vec3f cNext(lab.at<cv::Vec3b>(topY - 1, midX));
-                // Delta going upward (opposite of refDir for upward extension)
-                float dL = cPrev[0] - cNext[0], da = cPrev[1] - cNext[1], db = cPrev[2] - cNext[2];
-                float dot = dL * refDir[0] + da * refDir[1] + db * refDir[2];
-                // Must be same direction as bar gradient and not too large a jump
-                float jumpSq = dL*dL + da*da + db*db;
-                if (dot > 0 && jumpSq < 100.0f) {
-                    --topY;
-                } else {
-                    break;
+            // --- Step 4b: Refine boundaries using row-internal uniformity ---
+            //
+            // Inside the color bar, ALL pixels across the bar width at a given
+            // row have nearly identical color (it's a uniform gradient strip).
+            // At the text regions (e.g. "38.0"), pixels contain a mix of text
+            // strokes and background, creating high color variance across the row.
+            //
+            // We check variance across [bestStart-margin, bestEnd+margin] to
+            // also catch text that is adjacent to (not overlapping) the bar.
+
+            // Row uniformity: measure the color variance WITHIN the bar width.
+            // In the bar, all pixels at a given row are the same color → low var.
+            // In text regions, text strokes overlay the bar → high var.
+            // We use the standard deviation of Lab values across bar columns.
+            auto rowColorStdDev = [&](int y) -> double {
+                double sumL = 0, sumA = 0, sumB = 0;
+                double sumL2 = 0, sumA2 = 0, sumB2 = 0;
+                int n = 0;
+                for (int x = bestStart; x <= bestEnd; ++x) {
+                    cv::Vec3b px = lab.at<cv::Vec3b>(y, x);
+                    sumL += px[0]; sumA += px[1]; sumB += px[2];
+                    sumL2 += px[0]*px[0]; sumA2 += px[1]*px[1]; sumB2 += px[2]*px[2];
+                    ++n;
                 }
+                if (n < 2) return 0;
+                double varL = sumL2 / n - (sumL / n) * (sumL / n);
+                double varA = sumA2 / n - (sumA / n) * (sumA / n);
+                double varB = sumB2 / n - (sumB / n) * (sumB / n);
+                return std::sqrt(std::max(0.0, varL) + std::max(0.0, varA) + std::max(0.0, varB));
+            };
+
+            // Compute baseline stddev from the safe center 50% of the bar
+            int safeTop = topY + (bottomY - topY) / 4;
+            int safeBot = topY + 3 * (bottomY - topY) / 4;
+            double baselineStd = 0;
+            for (int y = safeTop; y <= safeBot; y += std::max(1, (safeBot-safeTop)/30)) {
+                baselineStd = std::max(baselineStd, rowColorStdDev(y));
             }
-            // Extend downward
-            for (int dy = 1; dy <= windowR + 2 && bottomY + 1 < h; ++dy) {
-                cv::Vec3f cPrev(lab.at<cv::Vec3b>(bottomY, midX));
-                cv::Vec3f cNext(lab.at<cv::Vec3b>(bottomY + 1, midX));
-                float dL = cNext[0] - cPrev[0], da = cNext[1] - cPrev[1], db = cNext[2] - cPrev[2];
-                float dot = dL * refDir[0] + da * refDir[1] + db * refDir[2];
-                float jumpSq = dL*dL + da*da + db*db;
-                if (dot > 0 && jumpSq < 100.0f) {
-                    ++bottomY;
-                } else {
-                    break;
-                }
+            // Text rows have much higher stddev (text strokes vs bar color)
+            // Threshold: significantly above baseline; at least 3.0 to avoid
+            // noise-level fluctuations in a pure color bar (stddev ≈ 0~2)
+            double stdThreshold = std::max(baselineStd * 5.0, 3.0);
+
+            // Trim from top
+            while (topY < safeTop && rowColorStdDev(topY) > stdThreshold) ++topY;
+            // Trim from bottom
+            while (bottomY > safeBot && rowColorStdDev(bottomY) > stdThreshold) --bottomY;
+
+            // Compensate for windowR: extend outward if rows are still uniform
+            for (int dy = 0; dy < windowR + 2 && topY - 1 >= 0; ++dy) {
+                if (rowColorStdDev(topY - 1) <= stdThreshold) --topY; else break;
+            }
+            for (int dy = 0; dy < windowR + 2 && bottomY + 1 < h; ++dy) {
+                if (rowColorStdDev(bottomY + 1) <= stdThreshold) ++bottomY; else break;
             }
         }
     }
