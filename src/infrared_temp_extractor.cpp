@@ -528,55 +528,80 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
     }
 
     // --- Step 4: Determine vertical extent ---
-    // Strategy: the color bar is the tallest vertical segment where the column
-    // maintains colorful (non-black, non-white) pixels. Walk up/down from center
-    // of the bar to find where it transitions to background (black/dark) or border.
+    // Strategy: scan the entire column to find the longest continuous run of
+    // "colorful" pixels. This is much more robust than scanning from the center,
+    // which can fail if the center pixel happens to be at a color with low
+    // brightness (e.g., deep blue/purple in JET colormap).
     int topY = 0, bottomY = h - 1;
     if (bestStart >= 0) {
-        int midX = (bestStart + bestEnd) / 2;
+        // Sample the inner columns of the bar to avoid edge pixels that may
+        // overlap with adjacent text or background
+        int innerStart = bestStart + std::max(1, (bestEnd - bestStart) / 4);
+        int innerEnd = bestEnd - std::max(1, (bestEnd - bestStart) / 4);
+        if (innerStart > innerEnd) {
+            innerStart = bestStart;
+            innerEnd = bestEnd;
+        }
 
-        // Walk upward from center: find where pixels become very dark or very bright
-        // (indicating border, text background, or end of bar)
-        for (int y = h / 2; y > 0; --y) {
-            // Sample a small horizontal band to be robust against edge noise
-            int darkCount = 0, totalCount = 0;
-            for (int x = bestStart; x <= bestEnd; ++x) {
+        // For each row, check if the inner bar pixels are "colorful"
+        // A pixel is colorful if it has reasonable brightness and saturation
+        std::vector<bool> isColorful(h, false);
+        for (int y = 0; y < h; ++y) {
+            int colorCount = 0, totalCount = 0;
+            for (int x = innerStart; x <= innerEnd; ++x) {
                 cv::Vec3b px = image.at<cv::Vec3b>(y, x);
+                int maxC = std::max({(int)px[0], (int)px[1], (int)px[2]});
+                int minC = std::min({(int)px[0], (int)px[1], (int)px[2]});
                 int brightness = (px[0] + px[1] + px[2]) / 3;
-                // Also check saturation — a color bar has saturated colors
-                cv::Vec3b hsvPx;
-                {
-                    // Quick saturation check: max(BGR) - min(BGR)
-                    int maxC = std::max({px[0], px[1], px[2]});
-                    int minC = std::min({px[0], px[1], px[2]});
-                    int sat = maxC - minC;
-                    if (brightness < 15 || sat < 10) ++darkCount;
+                int saturation = maxC - minC;
+                // Colorful: not black, not pure white, has some color difference
+                if (brightness > 10 && brightness < 250 && saturation > 5) {
+                    ++colorCount;
                 }
                 ++totalCount;
             }
-            // If most of the bar width is dark/unsaturated, we've left the bar
-            if (totalCount > 0 && darkCount > totalCount * 0.6) {
-                topY = y + 1;
-                break;
-            }
+            isColorful[y] = (totalCount > 0 && colorCount > totalCount / 2);
         }
 
-        // Walk downward from center
-        for (int y = h / 2; y < h - 1; ++y) {
-            int darkCount = 0, totalCount = 0;
-            for (int x = bestStart; x <= bestEnd; ++x) {
-                cv::Vec3b px = image.at<cv::Vec3b>(y, x);
-                int brightness = (px[0] + px[1] + px[2]) / 3;
-                int maxC = std::max({px[0], px[1], px[2]});
-                int minC = std::min({px[0], px[1], px[2]});
-                int sat = maxC - minC;
-                if (brightness < 15 || sat < 10) ++darkCount;
-                ++totalCount;
+        // Find the longest continuous run of colorful rows
+        int bestRunStart = 0, bestRunLen = 0;
+        int curRunStart = -1, curRunLen = 0;
+        int gapAllowance = 0; // allow small gaps (e.g., tick marks)
+
+        for (int y = 0; y < h; ++y) {
+            if (isColorful[y]) {
+                if (curRunStart < 0) {
+                    curRunStart = y;
+                    curRunLen = 1;
+                } else {
+                    curRunLen = y - curRunStart + 1;
+                }
+                gapAllowance = 3; // allow up to 3 non-colorful rows gap
+            } else {
+                if (curRunStart >= 0 && gapAllowance > 0) {
+                    --gapAllowance;
+                    curRunLen = y - curRunStart + 1;
+                } else {
+                    if (curRunLen > bestRunLen) {
+                        bestRunLen = curRunLen;
+                        bestRunStart = curRunStart;
+                    }
+                    curRunStart = -1;
+                    curRunLen = 0;
+                    gapAllowance = 0;
+                }
             }
-            if (totalCount > 0 && darkCount > totalCount * 0.6) {
-                bottomY = y - 1;
-                break;
-            }
+        }
+        if (curRunLen > bestRunLen) {
+            bestRunLen = curRunLen;
+            bestRunStart = curRunStart;
+        }
+
+        if (bestRunLen > h / 6) {
+            topY = bestRunStart;
+            bottomY = bestRunStart + bestRunLen - 1;
+            // Trim trailing non-colorful rows from the gap allowance
+            while (bottomY > topY && !isColorful[bottomY]) --bottomY;
         }
     }
 
@@ -592,6 +617,14 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
     bottomY = std::min(h - 1, bottomY);
     bestStart = std::max(0, bestStart);
     bestEnd = std::min(w - 1, bestEnd);
+
+    // Safety: ensure valid range (topY < bottomY with reasonable height)
+    if (topY >= bottomY || (bottomY - topY) < h / 8) {
+        std::cerr << "[Warning] Vertical extent detection failed (topY=" << topY
+                  << ", bottomY=" << bottomY << "), using full range\n";
+        topY = static_cast<int>(h * 0.05);
+        bottomY = static_cast<int>(h * 0.95);
+    }
 
     ColorBarInfo info;
     info.region = cv::Rect(bestStart, topY, bestEnd - bestStart + 1, bottomY - topY + 1);
