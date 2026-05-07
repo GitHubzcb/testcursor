@@ -384,6 +384,21 @@ public:
 
 // ============================================================================
 // Auto-detect the color bar region on the right side of the image.
+//
+// The key insight: a color bar has a MONOTONIC color gradient from top to
+// bottom, with high HORIZONTAL UNIFORMITY within each row. The main thermal
+// image has chaotic color patterns. We exploit this difference.
+//
+// Algorithm:
+// 1. For each column in the right 30% of the image, compute:
+//    a. Monotonicity score: how consistently does the L channel increase or
+//       decrease from top to bottom? (bar: high, body: low)
+//    b. Row uniformity: how similar are neighboring pixels in the same row?
+//       (bar: very similar, body: varies)
+// 2. Find narrow connected groups of columns that score high on both metrics.
+// 3. Prefer the rightmost, narrowest qualifying group (color bars are typically
+//    at the far right edge).
+// 4. Determine vertical extent by finding where the monotonic gradient starts/ends.
 // ============================================================================
 
 ColorBarInfo detectColorBar(const cv::Mat& image) {
@@ -393,109 +408,172 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
     cv::Mat lab;
     cv::cvtColor(image, lab, cv::COLOR_BGR2Lab);
 
-    int searchStart = static_cast<int>(w * 0.75);
+    // Search the rightmost 30% of the image
+    int searchStart = static_cast<int>(w * 0.70);
 
-    int rightBound = w - 1;
-    for (int x = w - 1; x > searchStart; --x) {
-        int nonBorderCount = 0;
-        for (int y = h / 4; y < 3 * h / 4; y += 5) {
-            cv::Vec3b px = image.at<cv::Vec3b>(y, x);
-            int brightness = (px[0] + px[1] + px[2]) / 3;
-            if (brightness > 15 && brightness < 245)
-                ++nonBorderCount;
-        }
-        if (nonBorderCount > (3 * h / 4 - h / 4) / (5 * 3)) {
-            rightBound = x;
-            break;
-        }
-    }
-
+    // --- Step 1: Score each column ---
     struct ColScore {
         int x;
-        double gradientScore;
-        double horizontalUniformity;
+        double dirConsistency; // consecutive color-delta direction consistency (0~1)
+        double rowUniformity;  // how uniform is each row within a local neighborhood (0~1)
     };
     std::vector<ColScore> scores;
 
-    for (int x = searchStart; x <= rightBound; ++x) {
-        double totalGrad = 0.0;
-        int gradCount = 0;
-        for (int y = h / 6; y < 5 * h / 6 - 2; y += 2) {
-            cv::Vec3f c1 = lab.at<cv::Vec3b>(y, x);
-            cv::Vec3f c2 = lab.at<cv::Vec3b>(y + 2, x);
-            double dL = c1[0] - c2[0];
-            double da = c1[1] - c2[1];
-            double db = c1[2] - c2[2];
-            totalGrad += std::sqrt(dL * dL + da * da + db * db);
-            ++gradCount;
-        }
-        double avgGrad = gradCount > 0 ? totalGrad / gradCount : 0;
+    // Vertical sampling range: avoid the very top/bottom (might have text/borders)
+    int sampleTop = h / 8;
+    int sampleBot = 7 * h / 8;
+    int sampleStep = std::max(1, (sampleBot - sampleTop) / 100);
 
-        double horizVar = 0.0;
-        int hCount = 0;
-        for (int y = h / 4; y < 3 * h / 4; y += 10) {
-            if (x > 0 && x < w - 1) {
-                cv::Vec3f cl = lab.at<cv::Vec3b>(y, x - 1);
-                cv::Vec3f cr = lab.at<cv::Vec3b>(y, x + 1);
-                double dL = cl[0] - cr[0];
-                double da = cl[1] - cr[1];
-                double db = cl[2] - cr[2];
-                horizVar += std::sqrt(dL * dL + da * da + db * db);
-                ++hCount;
+    for (int x = searchStart; x < w; ++x) {
+        // --- Direction consistency: for each pair of consecutive steps, compute
+        // the Lab color delta vector. A color bar has deltas that point in the
+        // same direction (positive dot product). Random image content does not. ---
+        int consistentPairs = 0, totalPairs = 0;
+        for (int y = sampleTop; y < sampleBot - sampleStep * 2; y += sampleStep) {
+            cv::Vec3f c1(lab.at<cv::Vec3b>(y, x));
+            cv::Vec3f c2(lab.at<cv::Vec3b>(y + sampleStep, x));
+            cv::Vec3f c3(lab.at<cv::Vec3b>(y + sampleStep * 2, x));
+            // Delta vectors in Lab space
+            float dL1 = c2[0] - c1[0], da1 = c2[1] - c1[1], db1 = c2[2] - c1[2];
+            float dL2 = c3[0] - c2[0], da2 = c3[1] - c2[1], db2 = c3[2] - c2[2];
+            // Dot product: positive means same direction
+            float dot = dL1 * dL2 + da1 * da2 + db1 * db2;
+            if (dot > 0) ++consistentPairs;
+            ++totalPairs;
+        }
+        double dirCon = totalPairs > 0 ?
+            static_cast<double>(consistentPairs) / totalPairs : 0;
+
+        // --- Row uniformity: compare this column with neighbors (±2 pixels) ---
+        double uniformSum = 0;
+        int uniformCount = 0;
+        for (int y = sampleTop; y < sampleBot; y += sampleStep * 2) {
+            cv::Vec3f center(lab.at<cv::Vec3b>(y, x));
+            double maxDiff = 0;
+            for (int dx = -2; dx <= 2; ++dx) {
+                int nx = x + dx;
+                if (nx < 0 || nx >= w || dx == 0) continue;
+                cv::Vec3f neighbor(lab.at<cv::Vec3b>(y, nx));
+                double diff = std::abs(center[0] - neighbor[0])
+                            + std::abs(center[1] - neighbor[1])
+                            + std::abs(center[2] - neighbor[2]);
+                maxDiff = std::max(maxDiff, diff);
             }
+            uniformSum += 1.0 / (1.0 + maxDiff / 10.0);
+            ++uniformCount;
         }
-        double avgHoriz = hCount > 0 ? horizVar / hCount : 999;
+        double rowUnif = uniformCount > 0 ? uniformSum / uniformCount : 0;
 
-        scores.push_back({x, avgGrad, avgHoriz});
+        scores.push_back({x, dirCon, rowUnif});
     }
 
+    // --- Step 2: Find candidate bar regions ---
+    // Color bar: high direction consistency (>0.6) AND moderate row uniformity (>0.3)
+    double dirThresh = 0.60;
+    double unifThresh = 0.30;
+
+    struct BarCandidate {
+        int startX, endX;
+        double score;
+    };
+    std::vector<BarCandidate> candidates;
+
+    size_t i = 0;
+    while (i < scores.size()) {
+        if (scores[i].dirConsistency >= dirThresh && scores[i].rowUniformity >= unifThresh) {
+            int startX = scores[i].x;
+            int endX = startX;
+            double totalScore = scores[i].dirConsistency + scores[i].rowUniformity;
+            int count = 1;
+
+            // Extend the run of qualifying columns (allow slightly lower thresholds
+            // for continuity, and allow up to 1 gap column for robustness)
+            size_t j = i + 1;
+            while (j < scores.size()
+                   && scores[j].x <= scores[j-1].x + 2
+                   && scores[j].dirConsistency >= dirThresh * 0.7
+                   && scores[j].rowUniformity >= unifThresh * 0.5) {
+                endX = scores[j].x;
+                totalScore += scores[j].dirConsistency + scores[j].rowUniformity;
+                ++count;
+                ++j;
+            }
+
+            int barWidth = endX - startX + 1;
+            // Color bar is typically 5-60 pixels wide
+            if (barWidth >= 3 && barWidth <= std::max(60, w / 8)) {
+                double avgScore = totalScore / count;
+                candidates.push_back({startX, endX, avgScore});
+            }
+            i = j;
+        } else {
+            ++i;
+        }
+    }
+
+    // --- Step 3: Select the best candidate ---
+    // Prefer: rightmost position (bars are at the edge), then highest score
     int bestStart = -1, bestEnd = -1;
-    double bestScore = -1;
+    double bestRank = -1;
 
-    for (size_t i = 0; i < scores.size(); ++i) {
-        if (scores[i].gradientScore > 1.0 && scores[i].horizontalUniformity < 20.0) {
-            int start = scores[i].x;
-            int end = start;
-            for (size_t j = i + 1; j < scores.size(); ++j) {
-                if (scores[j].gradientScore > 1.0 && scores[j].horizontalUniformity < 20.0) {
-                    end = scores[j].x;
-                } else {
-                    break;
-                }
-            }
-            int width = end - start + 1;
-            if (width >= 3 && width <= w / 6) {
-                double regionScore = 0;
-                for (int x = start; x <= end; ++x) {
-                    int idx = x - searchStart;
-                    if (idx >= 0 && idx < (int)scores.size())
-                        regionScore += scores[idx].gradientScore;
-                }
-                if (regionScore > bestScore) {
-                    bestScore = regionScore;
-                    bestStart = start;
-                    bestEnd = end;
-                }
-            }
+    for (auto& c : candidates) {
+        // Rank: heavily weight rightward position, then quality
+        double rightness = static_cast<double>(c.startX) / w;
+        double rank = rightness * 5.0 + c.score;
+        if (rank > bestRank) {
+            bestRank = rank;
+            bestStart = c.startX;
+            bestEnd = c.endX;
         }
     }
 
-    int topY = h / 8, bottomY = 7 * h / 8;
+    // --- Step 4: Determine vertical extent ---
+    // Strategy: the color bar is the tallest vertical segment where the column
+    // maintains colorful (non-black, non-white) pixels. Walk up/down from center
+    // of the bar to find where it transitions to background (black/dark) or border.
+    int topY = 0, bottomY = h - 1;
     if (bestStart >= 0) {
         int midX = (bestStart + bestEnd) / 2;
 
+        // Walk upward from center: find where pixels become very dark or very bright
+        // (indicating border, text background, or end of bar)
         for (int y = h / 2; y > 0; --y) {
-            cv::Vec3b px = image.at<cv::Vec3b>(y, midX);
-            int brightness = (px[0] + px[1] + px[2]) / 3;
-            if (brightness < 10 || brightness > 250) {
+            // Sample a small horizontal band to be robust against edge noise
+            int darkCount = 0, totalCount = 0;
+            for (int x = bestStart; x <= bestEnd; ++x) {
+                cv::Vec3b px = image.at<cv::Vec3b>(y, x);
+                int brightness = (px[0] + px[1] + px[2]) / 3;
+                // Also check saturation — a color bar has saturated colors
+                cv::Vec3b hsvPx;
+                {
+                    // Quick saturation check: max(BGR) - min(BGR)
+                    int maxC = std::max({px[0], px[1], px[2]});
+                    int minC = std::min({px[0], px[1], px[2]});
+                    int sat = maxC - minC;
+                    if (brightness < 15 || sat < 10) ++darkCount;
+                }
+                ++totalCount;
+            }
+            // If most of the bar width is dark/unsaturated, we've left the bar
+            if (totalCount > 0 && darkCount > totalCount * 0.6) {
                 topY = y + 1;
                 break;
             }
         }
+
+        // Walk downward from center
         for (int y = h / 2; y < h - 1; ++y) {
-            cv::Vec3b px = image.at<cv::Vec3b>(y, midX);
-            int brightness = (px[0] + px[1] + px[2]) / 3;
-            if (brightness < 10 || brightness > 250) {
+            int darkCount = 0, totalCount = 0;
+            for (int x = bestStart; x <= bestEnd; ++x) {
+                cv::Vec3b px = image.at<cv::Vec3b>(y, x);
+                int brightness = (px[0] + px[1] + px[2]) / 3;
+                int maxC = std::max({px[0], px[1], px[2]});
+                int minC = std::min({px[0], px[1], px[2]});
+                int sat = maxC - minC;
+                if (brightness < 15 || sat < 10) ++darkCount;
+                ++totalCount;
+            }
+            if (totalCount > 0 && darkCount > totalCount * 0.6) {
                 bottomY = y - 1;
                 break;
             }
@@ -503,11 +581,11 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
     }
 
     if (bestStart < 0) {
-        std::cerr << "[Warning] Auto-detection of color bar failed, using default region (rightmost 5%)\n";
-        bestStart = static_cast<int>(w * 0.93);
-        bestEnd = static_cast<int>(w * 0.98);
-        topY = static_cast<int>(h * 0.1);
-        bottomY = static_cast<int>(h * 0.9);
+        std::cerr << "[Warning] Auto-detection of color bar failed, using default region (rightmost 3%)\n";
+        bestStart = static_cast<int>(w * 0.95);
+        bestEnd = w - 1;
+        topY = static_cast<int>(h * 0.05);
+        bottomY = static_cast<int>(h * 0.95);
     }
 
     topY = std::max(0, topY);
@@ -518,15 +596,22 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
     ColorBarInfo info;
     info.region = cv::Rect(bestStart, topY, bestEnd - bestStart + 1, bottomY - topY + 1);
 
+    std::cout << "  Candidates evaluated: " << candidates.size() << "\n";
+
+    // --- Step 5: Sample colors along the color bar ---
     int sampleCount = bottomY - topY + 1;
     info.labColors.resize(sampleCount);
+
+    cv::Mat labForSample;
+    cv::cvtColor(image, labForSample, cv::COLOR_BGR2Lab);
 
     for (int y = topY; y <= bottomY; ++y) {
         cv::Vec3f avgColor(0, 0, 0);
         int count = 0;
+        // Average across the inner portion of the bar to avoid edge effects
         int margin = std::max(1, (bestEnd - bestStart + 1) / 4);
         for (int x = bestStart + margin; x <= bestEnd - margin; ++x) {
-            cv::Vec3b c = lab.at<cv::Vec3b>(y, x);
+            cv::Vec3b c = labForSample.at<cv::Vec3b>(y, x);
             avgColor[0] += c[0];
             avgColor[1] += c[1];
             avgColor[2] += c[2];
