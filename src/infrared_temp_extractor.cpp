@@ -528,58 +528,75 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
     }
 
     // --- Step 4: Determine vertical extent ---
-    // Strategy: scan the entire column to find the longest continuous run of
-    // "colorful" pixels. This is much more robust than scanning from the center,
-    // which can fail if the center pixel happens to be at a color with low
-    // brightness (e.g., deep blue/purple in JET colormap).
+    // Strategy: use the color-direction consistency metric along the bar column.
+    // Inside the color bar, consecutive rows have smooth, consistent color changes.
+    // At the boundary (background, text, border), color changes become abrupt or
+    // direction reverses. We find the longest segment with consistent direction.
+    //
+    // This is the same principle as the horizontal detection, applied vertically
+    // on a single column, and is much more precise than brightness/saturation checks.
     int topY = 0, bottomY = h - 1;
     if (bestStart >= 0) {
-        // Sample the inner columns of the bar to avoid edge pixels that may
-        // overlap with adjacent text or background
-        int innerStart = bestStart + std::max(1, (bestEnd - bestStart) / 4);
-        int innerEnd = bestEnd - std::max(1, (bestEnd - bestStart) / 4);
-        if (innerStart > innerEnd) {
-            innerStart = bestStart;
-            innerEnd = bestEnd;
+        int midX = (bestStart + bestEnd) / 2;
+
+        // Compute per-row color delta (in Lab) relative to the next row
+        // Then check direction consistency between consecutive deltas
+        struct RowDelta {
+            float dL, da, db;
+        };
+        std::vector<RowDelta> deltas(h);
+        for (int y = 0; y < h - 1; ++y) {
+            cv::Vec3f c1(lab.at<cv::Vec3b>(y, midX));
+            cv::Vec3f c2(lab.at<cv::Vec3b>(y + 1, midX));
+            deltas[y] = {c2[0] - c1[0], c2[1] - c1[1], c2[2] - c1[2]};
+        }
+        deltas[h - 1] = {0, 0, 0};
+
+        // For each row, compute a local "gradient activity" over a small window.
+        // A color bar row has: (1) non-zero gradient locally AND (2) consistent
+        // direction with neighbors. A background row has near-zero gradient.
+        // We combine both checks: the row must be inside a gradient region.
+        std::vector<bool> isBarRow(h, false);
+        int windowR = std::max(2, h / 100); // local window half-size for gradient check
+
+        for (int y = windowR; y < h - windowR; ++y) {
+            // Check gradient activity: color must change noticeably within
+            // a small window around this row (bar has continuous gradient)
+            cv::Vec3f cTop(lab.at<cv::Vec3b>(y - windowR, midX));
+            cv::Vec3f cBot(lab.at<cv::Vec3b>(y + windowR, midX));
+            float localDeltaSq = (cBot[0] - cTop[0]) * (cBot[0] - cTop[0])
+                               + (cBot[1] - cTop[1]) * (cBot[1] - cTop[1])
+                               + (cBot[2] - cTop[2]) * (cBot[2] - cTop[2]);
+            // Require a noticeable color change within the window
+            // (filters out flat background even if it's colorful)
+            if (localDeltaSq < 4.0f) continue;
+
+            // Check direction consistency: delta at y and delta at y+1
+            // should point in the same direction
+            float dot = deltas[y].dL * deltas[y + 1].dL
+                      + deltas[y].da * deltas[y + 1].da
+                      + deltas[y].db * deltas[y + 1].db;
+            isBarRow[y] = (dot >= 0);
         }
 
-        // For each row, check if the inner bar pixels are "colorful"
-        // A pixel is colorful if it has reasonable brightness and saturation
-        std::vector<bool> isColorful(h, false);
-        for (int y = 0; y < h; ++y) {
-            int colorCount = 0, totalCount = 0;
-            for (int x = innerStart; x <= innerEnd; ++x) {
-                cv::Vec3b px = image.at<cv::Vec3b>(y, x);
-                int maxC = std::max({(int)px[0], (int)px[1], (int)px[2]});
-                int minC = std::min({(int)px[0], (int)px[1], (int)px[2]});
-                int brightness = (px[0] + px[1] + px[2]) / 3;
-                int saturation = maxC - minC;
-                // Colorful: not black, not pure white, has some color difference
-                if (brightness > 10 && brightness < 250 && saturation > 5) {
-                    ++colorCount;
-                }
-                ++totalCount;
-            }
-            isColorful[y] = (totalCount > 0 && colorCount > totalCount / 2);
-        }
-
-        // Find the longest continuous run of colorful rows
+        // Find the longest continuous run of bar rows (allow small gaps)
         int bestRunStart = 0, bestRunLen = 0;
         int curRunStart = -1, curRunLen = 0;
-        int gapAllowance = 0; // allow small gaps (e.g., tick marks)
+        int gapCount = 0;
+        const int maxGap = 3;
 
         for (int y = 0; y < h; ++y) {
-            if (isColorful[y]) {
+            if (isBarRow[y]) {
                 if (curRunStart < 0) {
                     curRunStart = y;
                     curRunLen = 1;
                 } else {
                     curRunLen = y - curRunStart + 1;
                 }
-                gapAllowance = 3; // allow up to 3 non-colorful rows gap
+                gapCount = 0;
             } else {
-                if (curRunStart >= 0 && gapAllowance > 0) {
-                    --gapAllowance;
+                if (curRunStart >= 0 && gapCount < maxGap) {
+                    ++gapCount;
                     curRunLen = y - curRunStart + 1;
                 } else {
                     if (curRunLen > bestRunLen) {
@@ -588,7 +605,7 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
                     }
                     curRunStart = -1;
                     curRunLen = 0;
-                    gapAllowance = 0;
+                    gapCount = 0;
                 }
             }
         }
@@ -597,11 +614,56 @@ ColorBarInfo detectColorBar(const cv::Mat& image) {
             bestRunStart = curRunStart;
         }
 
-        if (bestRunLen > h / 6) {
+        if (bestRunLen > h / 8) {
             topY = bestRunStart;
             bottomY = bestRunStart + bestRunLen - 1;
-            // Trim trailing non-colorful rows from the gap allowance
-            while (bottomY > topY && !isColorful[bottomY]) --bottomY;
+            // Trim trailing/leading non-bar rows from gap allowance
+            while (bottomY > topY && !isBarRow[bottomY]) --bottomY;
+            while (topY < bottomY && !isBarRow[topY]) ++topY;
+            // Compensate for the window radius used in gradient detection:
+            // the first/last windowR rows cannot be detected, but they may still
+            // be part of the bar gradient. Extend outward only if the color change
+            // is small and consistent (same direction as the bar's gradient).
+            // Compute average gradient direction inside the bar for reference
+            cv::Vec3f refDir(0, 0, 0);
+            int midRange = (topY + bottomY) / 2;
+            int spanR = (bottomY - topY) / 4;
+            for (int y = midRange - spanR; y < midRange + spanR && y < h - 1; ++y) {
+                cv::Vec3f c1(lab.at<cv::Vec3b>(y, midX));
+                cv::Vec3f c2(lab.at<cv::Vec3b>(y + 1, midX));
+                refDir[0] += c2[0] - c1[0];
+                refDir[1] += c2[1] - c1[1];
+                refDir[2] += c2[2] - c1[2];
+            }
+
+            // Extend upward: color should keep changing in the same direction
+            for (int dy = 1; dy <= windowR + 2 && topY - 1 >= 0; ++dy) {
+                cv::Vec3f cPrev(lab.at<cv::Vec3b>(topY, midX));
+                cv::Vec3f cNext(lab.at<cv::Vec3b>(topY - 1, midX));
+                // Delta going upward (opposite of refDir for upward extension)
+                float dL = cPrev[0] - cNext[0], da = cPrev[1] - cNext[1], db = cPrev[2] - cNext[2];
+                float dot = dL * refDir[0] + da * refDir[1] + db * refDir[2];
+                // Must be same direction as bar gradient and not too large a jump
+                float jumpSq = dL*dL + da*da + db*db;
+                if (dot > 0 && jumpSq < 100.0f) {
+                    --topY;
+                } else {
+                    break;
+                }
+            }
+            // Extend downward
+            for (int dy = 1; dy <= windowR + 2 && bottomY + 1 < h; ++dy) {
+                cv::Vec3f cPrev(lab.at<cv::Vec3b>(bottomY, midX));
+                cv::Vec3f cNext(lab.at<cv::Vec3b>(bottomY + 1, midX));
+                float dL = cNext[0] - cPrev[0], da = cNext[1] - cPrev[1], db = cNext[2] - cPrev[2];
+                float dot = dL * refDir[0] + da * refDir[1] + db * refDir[2];
+                float jumpSq = dL*dL + da*da + db*db;
+                if (dot > 0 && jumpSq < 100.0f) {
+                    ++bottomY;
+                } else {
+                    break;
+                }
+            }
         }
     }
 
