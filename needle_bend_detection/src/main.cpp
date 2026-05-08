@@ -15,6 +15,8 @@ struct BendResult {
     cv::Point2d tail_point;
     std::vector<cv::Point2d> centerline;
     cv::Vec4f straight_line_params;
+    cv::Vec4f bend_line_params;   // 弯曲段中心线拟合直线参数
+    int bend_idx;                 // 弯曲点在中心线中的索引
 };
 
 // 基于轮廓的上下边缘提取中心线（针对近水平的针体更精确）
@@ -403,7 +405,7 @@ BendResult detectNeedleBend(const cv::Mat& src) {
               << " refined=" << bend_idx << std::endl;
 
     // 7. 计算弯曲角度
-    // 直线段方向
+    // 直线段方向：用弯曲点之前的中心线拟合
     std::vector<cv::Point2f> final_straight_pts;
     for (int i = 0; i < bend_idx; i++) {
         final_straight_pts.push_back(cv::Point2f(centerline[i].x, centerline[i].y));
@@ -415,25 +417,34 @@ BendResult detectNeedleBend(const cv::Mat& src) {
 
     double vx_s = ref_line[0], vy_s = ref_line[1];
 
-    // 弯曲段末端方向（针尖附近的切线）
-    int tip_fit_count = std::min(20, n - bend_idx);
-    if (tip_fit_count < 3) tip_fit_count = 3;
-    std::vector<cv::Point2f> tip_pts;
-    for (int i = n - tip_fit_count; i < n; i++) {
-        tip_pts.push_back(cv::Point2f(centerline[i].x, centerline[i].y));
+    // 弯曲段方向：用整个弯曲段的中心线拟合（而非仅针尖处）
+    // 这样得到的是弯曲段的整体方向，避免针尖几何形状导致角度偏大
+    std::vector<cv::Point2f> bend_section_pts;
+    for (int i = bend_idx; i < n; i++) {
+        bend_section_pts.push_back(cv::Point2f(centerline[i].x, centerline[i].y));
     }
 
-    cv::Vec4f tip_line;
-    cv::fitLine(tip_pts, tip_line, cv::DIST_L2, 0, 0.01, 0.01);
-    double vx_t = tip_line[0], vy_t = tip_line[1];
+    cv::Vec4f bend_line;
+    if (bend_section_pts.size() >= 5) {
+        cv::fitLine(bend_section_pts, bend_line, cv::DIST_L2, 0, 0.01, 0.01);
+    } else {
+        // 点太少时用首尾方向代替
+        cv::Point2d dir = centerline.back() - centerline[bend_idx];
+        double len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+        bend_line = cv::Vec4f(dir.x / len, dir.y / len, 
+                              centerline[bend_idx].x, centerline[bend_idx].y);
+    }
+    double vx_t = bend_line[0], vy_t = bend_line[1];
 
-    // 保证方向一致（从尾向尖的方向）
+    // 保证方向一致（从尾向尖的方向，即x递减方向）
     if (vx_s > 0) { vx_s = -vx_s; vy_s = -vy_s; }
     if (vx_t > 0) { vx_t = -vx_t; vy_t = -vy_t; }
 
     double dot = vx_s * vx_t + vy_s * vy_t;
     double cross = vx_s * vy_t - vy_s * vx_t;
     result.bend_angle = std::atan2(std::abs(cross), dot) * 180.0 / CV_PI;
+    result.bend_line_params = bend_line;
+    result.bend_idx = bend_idx;
 
     // 8. 弯曲弧长
     double arc_length = 0;
@@ -475,10 +486,23 @@ void drawResults(cv::Mat& vis, const BendResult& result) {
         cv::line(vis, pt1, pt2, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
     }
 
-    // 在弯曲区域靠下端画一条弦线（橙色）
+    // 在弯曲区域画弯曲段中心线拟合直线（橙色）
+    // 这条直线代表弯曲段的整体方向，而非弯曲点到针尖的连线
+    cv::Vec4f bl = result.bend_line_params;
+    double bvx = bl[0], bvy = bl[1], bx0 = bl[2], by0 = bl[3];
     cv::Point bend_pt(cvRound(result.bend_point.x), cvRound(result.bend_point.y));
     cv::Point tip_pt(cvRound(result.tip_point.x), cvRound(result.tip_point.y));
-    cv::line(vis, bend_pt, tip_pt, cv::Scalar(0, 140, 255), 2, cv::LINE_AA);
+
+    if (std::abs(bvx) > 1e-6) {
+        // 计算弯曲段直线在弯曲区域x范围内的两个端点
+        double x_start = result.bend_point.x;
+        double x_end = result.tip_point.x;
+        double y_start = by0 + (x_start - bx0) * bvy / bvx;
+        double y_end = by0 + (x_end - bx0) * bvy / bvx;
+        cv::Point bl_pt1(cvRound(x_start), cvRound(y_start));
+        cv::Point bl_pt2(cvRound(x_end), cvRound(y_end));
+        cv::line(vis, bl_pt1, bl_pt2, cv::Scalar(0, 140, 255), 2, cv::LINE_AA);
+    }
 
     // 标记弯曲点（红色圆圈）
     cv::circle(vis, bend_pt, 8, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
@@ -496,14 +520,17 @@ void drawResults(cv::Mat& vis, const BendResult& result) {
     cv::Point tail_pt(cvRound(result.tail_point.x), cvRound(result.tail_point.y));
     cv::circle(vis, tail_pt, 5, cv::Scalar(255, 200, 0), 2, cv::LINE_AA);
 
-    // 画弯曲角度弧线标注
+    // 画弯曲角度弧线标注（用弯曲段拟合方向而非针尖方向）
     int arc_radius = 30;
     double angle_straight = std::atan2(vy, vx) * 180.0 / CV_PI;
-    cv::Point2d dir_tip = result.tip_point - result.bend_point;
-    double angle_tip = std::atan2(dir_tip.y, dir_tip.x) * 180.0 / CV_PI;
+    double angle_bend = std::atan2(bvy, bvx) * 180.0 / CV_PI;
+    // 保证角度方向和弯曲段方向一致
+    if (bvx > 0) angle_bend = std::atan2(-bvy, -bvx) * 180.0 / CV_PI;
+    if (vx > 0) angle_straight = std::atan2(-vy, -vx) * 180.0 / CV_PI;
     cv::ellipse(vis, bend_pt, cv::Size(arc_radius, arc_radius),
-                0, angle_straight, angle_tip,
-                cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+                0, std::min(angle_straight, angle_bend), 
+                std::max(angle_straight, angle_bend),
+                cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
     // 角度数值标注
     std::string angle_text = cv::format("%.2f deg", result.bend_angle);
