@@ -7,16 +7,18 @@
 #include <numeric>
 
 struct BendResult {
-    cv::Point2d bend_point;
-    double bend_angle;
-    double bend_length;
-    double straight_length;
-    cv::Point2d tip_point;
-    cv::Point2d tail_point;
+    cv::Point2d bend_point;         // 弯曲点（两条拟合线的交点）
+    double bend_angle;              // 弯曲角度
+    double bend_length;             // 弯曲长度（垂线与边缘交点到针尖的距离）
+    double bend_arc_length;         // 弯曲弧长（沿中心线的弧长）
+    double straight_length;         // 直线段长度
+    cv::Point2d tip_point;          // 针尖点
+    cv::Point2d tail_point;         // 针尾点
+    cv::Point2d perp_edge_point;    // 垂线与针边缘的交点
     std::vector<cv::Point2d> centerline;
     cv::Vec4f straight_line_params;
-    cv::Vec4f bend_line_params;   // 弯曲段中心线拟合直线参数
-    int bend_idx;                 // 弯曲点在中心线中的索引
+    cv::Vec4f bend_line_params;     // 弯曲段中心线拟合直线参数
+    int bend_idx;                   // 弯曲点在中心线中的索引
 };
 
 // 基于轮廓的上下边缘提取中心线（针对近水平的针体更精确）
@@ -441,26 +443,100 @@ BendResult detectNeedleBend(const cv::Mat& src) {
     if (vx_t > 0) { vx_t = -vx_t; vy_t = -vy_t; }
 
     double dot = vx_s * vx_t + vy_s * vy_t;
-    double cross = vx_s * vy_t - vy_s * vx_t;
-    result.bend_angle = std::atan2(std::abs(cross), dot) * 180.0 / CV_PI;
+    double cross_val = vx_s * vy_t - vy_s * vx_t;
+    result.bend_angle = std::atan2(std::abs(cross_val), dot) * 180.0 / CV_PI;
     result.bend_line_params = bend_line;
     result.bend_idx = bend_idx;
 
-    // 8. 弯曲弧长
-    double arc_length = 0;
-    for (int i = bend_idx; i < n - 1; i++) {
-        double dx = centerline[i+1].x - centerline[i].x;
-        double dy = centerline[i+1].y - centerline[i].y;
-        arc_length += std::sqrt(dx * dx + dy * dy);
+    // 8. 求两条拟合直线的交点作为弯曲点
+    // 直线1: P = (ref_line[2], ref_line[3]) + t * (ref_line[0], ref_line[1])
+    // 直线2: P = (bend_line[2], bend_line[3]) + s * (bend_line[0], bend_line[1])
+    double x1 = ref_line[2], y1 = ref_line[3], dx1 = ref_line[0], dy1 = ref_line[1];
+    double x2 = bend_line[2], y2 = bend_line[3], dx2 = bend_line[0], dy2 = bend_line[1];
+
+    double denom = dx1 * dy2 - dy1 * dx2;
+    if (std::abs(denom) > 1e-8) {
+        double t = ((x2 - x1) * dy2 - (y2 - y1) * dx2) / denom;
+        result.bend_point = cv::Point2d(x1 + t * dx1, y1 + t * dy1);
+    } else {
+        // 两线近平行，用之前的检测结果
+        result.bend_point = centerline[bend_idx];
     }
-    result.bend_length = arc_length;
+
+    std::cout << "Line intersection bend point: (" 
+              << result.bend_point.x << ", " << result.bend_point.y << ")" << std::endl;
+
+    // 9. 在交点处作弯曲段拟合线的垂直线，找与针边缘的交点
+    // 垂直线方向: (-dy2, dx2)（弯曲段方向的法向量）
+    double perp_dx = -bend_line[1];  // 垂直方向x
+    double perp_dy = bend_line[0];   // 垂直方向y
+    double perp_len = std::sqrt(perp_dx * perp_dx + perp_dy * perp_dy);
+    perp_dx /= perp_len;
+    perp_dy /= perp_len;
+
+    // 找中心线上距离交点最近的点
+    int closest_idx = bend_idx;
+    double min_dist_to_intersection = 1e9;
+    for (int i = 0; i < n; i++) {
+        double ddx = centerline[i].x - result.bend_point.x;
+        double ddy = centerline[i].y - result.bend_point.y;
+        double d = std::sqrt(ddx * ddx + ddy * ddy);
+        if (d < min_dist_to_intersection) {
+            min_dist_to_intersection = d;
+            closest_idx = i;
+        }
+    }
+    result.bend_idx = closest_idx;
+
+    // 沿垂直方向在needle_mask上搜索边缘点
+    // 从交点向两个方向射线搜索，找到mask边缘
+    cv::Point2d edge_lower = result.bend_point;
+    cv::Point2d edge_upper = result.bend_point;
+
+    for (int step = 1; step < 200; step++) {
+        int px = cvRound(result.bend_point.x + perp_dx * step);
+        int py = cvRound(result.bend_point.y + perp_dy * step);
+        if (px < 0 || px >= needle_mask.cols || py < 0 || py >= needle_mask.rows) break;
+        if (needle_mask.at<uchar>(py, px) == 0) {
+            edge_lower = cv::Point2d(px, py);
+            break;
+        }
+        edge_lower = cv::Point2d(px, py);
+    }
+    for (int step = 1; step < 200; step++) {
+        int px = cvRound(result.bend_point.x - perp_dx * step);
+        int py = cvRound(result.bend_point.y - perp_dy * step);
+        if (px < 0 || px >= needle_mask.cols || py < 0 || py >= needle_mask.rows) break;
+        if (needle_mask.at<uchar>(py, px) == 0) {
+            edge_upper = cv::Point2d(px, py);
+            break;
+        }
+        edge_upper = cv::Point2d(px, py);
+    }
+
+    // 取靠下方的边缘点作为弯曲长度的起点
+    result.perp_edge_point = (edge_lower.y > edge_upper.y) ? edge_lower : edge_upper;
+
+    // 10. 弯曲长度：从垂线与针边缘交点到针尖的直线距离
+    double bend_len_dx = result.tip_point.x - result.perp_edge_point.x;
+    double bend_len_dy = result.tip_point.y - result.perp_edge_point.y;
+    result.bend_length = std::sqrt(bend_len_dx * bend_len_dx + bend_len_dy * bend_len_dy);
+
+    // 弯曲弧长（沿中心线）
+    double arc_length = 0;
+    for (int i = closest_idx; i < n - 1; i++) {
+        double adx = centerline[i+1].x - centerline[i].x;
+        double ady = centerline[i+1].y - centerline[i].y;
+        arc_length += std::sqrt(adx * adx + ady * ady);
+    }
+    result.bend_arc_length = arc_length;
 
     // 直线段长度
     double straight_len = 0;
-    for (int i = 0; i < bend_idx - 1; i++) {
-        double dx = centerline[i+1].x - centerline[i].x;
-        double dy = centerline[i+1].y - centerline[i].y;
-        straight_len += std::sqrt(dx * dx + dy * dy);
+    for (int i = 0; i < closest_idx; i++) {
+        double sdx = centerline[i+1].x - centerline[i].x;
+        double sdy = centerline[i+1].y - centerline[i].y;
+        straight_len += std::sqrt(sdx * sdx + sdy * sdy);
     }
     result.straight_length = straight_len;
 
@@ -477,7 +553,7 @@ void drawResults(cv::Mat& vis, const BendResult& result) {
         cv::line(vis, p1, p2, cv::Scalar(0, 200, 0), 1, cv::LINE_AA);
     }
 
-    // 画参考直线（延伸到图像边缘，黄色）
+    // 画直线段拟合线（黄色，延伸到图像边缘）
     cv::Vec4f sl = result.straight_line_params;
     double vx = sl[0], vy = sl[1], x0 = sl[2], y0 = sl[3];
     if (std::abs(vx) > 1e-6) {
@@ -486,17 +562,18 @@ void drawResults(cv::Mat& vis, const BendResult& result) {
         cv::line(vis, pt1, pt2, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
     }
 
-    // 在弯曲区域画弯曲段中心线拟合直线（橙色）
-    // 这条直线代表弯曲段的整体方向，而非弯曲点到针尖的连线
+    // 画弯曲段拟合直线（橙色，从交点延伸到超过针尖位置）
     cv::Vec4f bl = result.bend_line_params;
     double bvx = bl[0], bvy = bl[1], bx0 = bl[2], by0 = bl[3];
     cv::Point bend_pt(cvRound(result.bend_point.x), cvRound(result.bend_point.y));
     cv::Point tip_pt(cvRound(result.tip_point.x), cvRound(result.tip_point.y));
 
     if (std::abs(bvx) > 1e-6) {
-        // 计算弯曲段直线在弯曲区域x范围内的两个端点
         double x_start = result.bend_point.x;
         double x_end = result.tip_point.x;
+        // 稍微延伸超出
+        double extend = (x_start - x_end) * 0.1;
+        x_end -= extend;
         double y_start = by0 + (x_start - bx0) * bvy / bvx;
         double y_end = by0 + (x_end - bx0) * bvy / bvx;
         cv::Point bl_pt1(cvRound(x_start), cvRound(y_start));
@@ -504,10 +581,32 @@ void drawResults(cv::Mat& vis, const BendResult& result) {
         cv::line(vis, bl_pt1, bl_pt2, cv::Scalar(0, 140, 255), 2, cv::LINE_AA);
     }
 
-    // 标记弯曲点（红色圆圈）
+    // 画垂直线（在弯曲点处，与弯曲段拟合线垂直，白色）
+    double perp_dx = -bvy;  // 弯曲段方向的法向量
+    double perp_dy = bvx;
+    double perp_len_norm = std::sqrt(perp_dx * perp_dx + perp_dy * perp_dy);
+    if (perp_len_norm > 1e-6) {
+        perp_dx /= perp_len_norm;
+        perp_dy /= perp_len_norm;
+    }
+    // 画垂直线：从弯曲点向两侧延伸一定长度
+    double perp_half_len = 40.0;
+    cv::Point perp_pt1(cvRound(result.bend_point.x + perp_dx * perp_half_len),
+                       cvRound(result.bend_point.y + perp_dy * perp_half_len));
+    cv::Point perp_pt2(cvRound(result.bend_point.x - perp_dx * perp_half_len),
+                       cvRound(result.bend_point.y - perp_dy * perp_half_len));
+    cv::line(vis, perp_pt1, perp_pt2, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+
+    // 画弯曲长度线（从垂线边缘交点到针尖的连线，浅蓝色）
+    cv::Point perp_edge(cvRound(result.perp_edge_point.x), cvRound(result.perp_edge_point.y));
+    cv::line(vis, perp_edge, tip_pt, cv::Scalar(255, 200, 100), 2, cv::LINE_AA);
+    // 标记垂线边缘交点
+    cv::circle(vis, perp_edge, 5, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+
+    // 标记弯曲点（两线交点，红色圆圈）
     cv::circle(vis, bend_pt, 8, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
-    cv::putText(vis, "Bend Start",
-                cv::Point(bend_pt.x - 10, bend_pt.y - 15),
+    cv::putText(vis, "Bend Point",
+                cv::Point(bend_pt.x - 10, bend_pt.y - 20),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
 
     // 标记针尖（紫色）
@@ -520,33 +619,30 @@ void drawResults(cv::Mat& vis, const BendResult& result) {
     cv::Point tail_pt(cvRound(result.tail_point.x), cvRound(result.tail_point.y));
     cv::circle(vis, tail_pt, 5, cv::Scalar(255, 200, 0), 2, cv::LINE_AA);
 
-    // 画弯曲角度弧线标注（用弯曲段拟合方向而非针尖方向）
-    int arc_radius = 30;
+    // 画弯曲角度弧线标注
+    int arc_radius = 35;
     double angle_straight = std::atan2(vy, vx) * 180.0 / CV_PI;
     double angle_bend = std::atan2(bvy, bvx) * 180.0 / CV_PI;
-    // 保证角度方向和弯曲段方向一致
     if (bvx > 0) angle_bend = std::atan2(-bvy, -bvx) * 180.0 / CV_PI;
     if (vx > 0) angle_straight = std::atan2(-vy, -vx) * 180.0 / CV_PI;
     cv::ellipse(vis, bend_pt, cv::Size(arc_radius, arc_radius),
-                0, std::min(angle_straight, angle_bend), 
+                0, std::min(angle_straight, angle_bend),
                 std::max(angle_straight, angle_bend),
                 cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
 
     // 角度数值标注
     std::string angle_text = cv::format("%.2f deg", result.bend_angle);
     cv::putText(vis, angle_text,
-                cv::Point(bend_pt.x + 15, bend_pt.y + 30),
+                cv::Point(bend_pt.x + 15, bend_pt.y + 35),
                 cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
 
-    // 弯曲长度标注
-    int mid_bend = n * 3 / 4;
-    if (mid_bend < n) {
-        std::string len_text = cv::format("Arc=%.1fpx", result.bend_length);
-        cv::putText(vis, len_text,
-                    cv::Point(cvRound(result.centerline[mid_bend].x),
-                              cvRound(result.centerline[mid_bend].y) + 20),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 180, 0), 1, cv::LINE_AA);
-    }
+    // 弯曲长度标注（在弯曲长度线的中间位置）
+    cv::Point2d mid_len((result.perp_edge_point.x + result.tip_point.x) / 2.0,
+                        (result.perp_edge_point.y + result.tip_point.y) / 2.0);
+    std::string len_text = cv::format("L=%.1fpx", result.bend_length);
+    cv::putText(vis, len_text,
+                cv::Point(cvRound(mid_len.x), cvRound(mid_len.y) + 20),
+                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(255, 200, 100), 1, cv::LINE_AA);
 }
 
 int main(int argc, char** argv) {
@@ -589,23 +685,19 @@ int main(int argc, char** argv) {
     std::cout << "============================================" << std::endl;
     std::cout << std::fixed;
     std::cout.precision(2);
-    std::cout << "  Bend Angle:      " << result.bend_angle << " degrees" << std::endl;
-    std::cout << "  Bend Arc Length:  " << result.bend_length / scale << " pixels" << std::endl;
+    std::cout << "  Bend Angle:       " << result.bend_angle << " degrees" << std::endl;
+    std::cout << "  Bend Length:      " << result.bend_length / scale << " pixels (line intersection to tip)" << std::endl;
+    std::cout << "  Bend Arc Length:  " << result.bend_arc_length / scale << " pixels (along centerline)" << std::endl;
     std::cout << "  Straight Length:  " << result.straight_length / scale << " pixels" << std::endl;
-    std::cout << "  Bend Position:   (" 
+    std::cout << "  Bend Position:    (" 
               << result.bend_point.x / scale << ", " 
-              << result.bend_point.y / scale << ")" << std::endl;
-    std::cout << "  Tip Position:    (" 
+              << result.bend_point.y / scale << ") [two-line intersection]" << std::endl;
+    std::cout << "  Tip Position:     (" 
               << result.tip_point.x / scale << ", "
               << result.tip_point.y / scale << ")" << std::endl;
-    std::cout << "  Tail Position:   ("
+    std::cout << "  Tail Position:    ("
               << result.tail_point.x / scale << ", "
               << result.tail_point.y / scale << ")" << std::endl;
-    std::cout << "  Total Length:    " 
-              << (result.straight_length + result.bend_length) / scale << " pixels" << std::endl;
-    std::cout << "  Bend Ratio:      " 
-              << result.bend_length / (result.straight_length + result.bend_length) * 100.0
-              << "%" << std::endl;
     std::cout << "============================================\n" << std::endl;
 
     // 可视化
@@ -621,24 +713,22 @@ int main(int argc, char** argv) {
     cv::putText(output, cv::format("Bend Angle: %.2f deg", result.bend_angle),
                 cv::Point(10, y_text), cv::FONT_HERSHEY_SIMPLEX, 0.55,
                 cv::Scalar(0, 255, 255), 1);
-    cv::putText(output, cv::format("Bend Length: %.1f px (arc)", result.bend_length / scale),
+    cv::putText(output, cv::format("Bend Length: %.1f px", result.bend_length / scale),
                 cv::Point(10, y_text + 22), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                cv::Scalar(255, 200, 100), 1);
+    cv::putText(output, cv::format("Bend Arc: %.1f px", result.bend_arc_length / scale),
+                cv::Point(10, y_text + 44), cv::FONT_HERSHEY_SIMPLEX, 0.55,
                 cv::Scalar(0, 255, 200), 1);
     cv::putText(output, cv::format("Bend Position: (%.0f, %.0f)",
                 result.bend_point.x / scale, result.bend_point.y / scale),
-                cv::Point(10, y_text + 44), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                cv::Point(400, y_text), cv::FONT_HERSHEY_SIMPLEX, 0.55,
                 cv::Scalar(200, 200, 255), 1);
     cv::putText(output, cv::format("Straight Length: %.1f px", result.straight_length / scale),
-                cv::Point(400, y_text), cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                cv::Scalar(200, 255, 200), 1);
-    cv::putText(output, cv::format("Total Length: %.1f px",
-                (result.straight_length + result.bend_length) / scale),
                 cv::Point(400, y_text + 22), cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                cv::Scalar(220, 220, 220), 1);
-    cv::putText(output, cv::format("Bend Ratio: %.1f%%",
-                result.bend_length / (result.straight_length + result.bend_length) * 100.0),
+                cv::Scalar(200, 255, 200), 1);
+    cv::putText(output, cv::format("Method: two-line intersection"),
                 cv::Point(400, y_text + 44), cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                cv::Scalar(220, 180, 255), 1);
+                cv::Scalar(180, 180, 180), 1);
 
     // 保存
     std::string output_path = "output_result.jpg";
