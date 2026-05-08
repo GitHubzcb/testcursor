@@ -1,0 +1,4 @@
+build/
+output_*.jpg
+*.pyc
+__pycache__/
