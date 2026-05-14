@@ -1,0 +1,8 @@
+build/
+tests/test_infrared.png
+tests/output_*.csv
+tests/output_*.png
+*.o
+*.d
+tests/test_realistic.png
+tests/test_overlap.png
